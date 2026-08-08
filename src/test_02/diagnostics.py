@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import string
 import sys
+from ipaddress import ip_address
 from importlib import metadata
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -32,6 +33,26 @@ def _has_invalid_percent_escape(value: str) -> bool:
         ):
             return True
     return False
+
+
+def _is_valid_prepared_hostname(value: str) -> bool:
+    try:
+        ip_address(value)
+    except ValueError:
+        hostname = value[:-1] if value.endswith(".") else value
+        labels = hostname.split(".")
+        return bool(hostname) and len(hostname) <= 253 and all(
+            label
+            and len(label) <= 63
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and all(
+                character.isascii() and (character.isalnum() or character == "-")
+                for character in label
+            )
+            for label in labels
+        )
+    return True
 
 
 def diagnose_base_url(value: str) -> JsonObject:
@@ -73,6 +94,10 @@ def diagnose_base_url(value: str) -> JsonObject:
         prepared_url = urlsplit(prepared.url)
     except (RequestException, ValueError):
         return _failure("invalid_base_url", "base URL is not supported by the HTTP client")
+
+    prepared_hostname = prepared_url.hostname
+    if prepared_hostname is None or not _is_valid_prepared_hostname(prepared_hostname):
+        return _failure("invalid_base_url", "base URL has an invalid host or port")
 
     path = prepared_url.path.rstrip("/")
     normalized = urlunsplit(
