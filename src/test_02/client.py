@@ -135,9 +135,18 @@ def _discovery_query(
         ):
             raise ApiError(f"invalid discovery option '{name}': expected a non-blank string")
 
-    if sort is not None and sort not in _SORT_FIELDS:
+    status = str(status) if status is not None else None
+    category = str(category) if category is not None else None
+    label = str(label) if label is not None else None
+    q = str(q) if q is not None else None
+    sort = str(sort) if isinstance(sort, str) else sort
+    order = str(order) if isinstance(order, str) else order
+
+    if sort is not None and (not isinstance(sort, str) or sort not in _SORT_FIELDS):
         raise ApiError("invalid discovery option 'sort': expected id, name, or status")
-    if order is not None and order not in _SORT_ORDERS:
+    if order is not None and (
+        not isinstance(order, str) or order not in _SORT_ORDERS
+    ):
         raise ApiError("invalid discovery option 'order': expected asc or desc")
     if order is not None and sort is None:
         raise ApiError("invalid discovery option 'order': requires 'sort'")
@@ -194,7 +203,7 @@ def _validate_collection_envelope(payload: JsonObject, expected_query: JsonObjec
         raise ApiError("GET /api/items returned invalid query metadata")
     for name, expected_value in expected_query.items():
         actual_value = query[name]
-        if type(actual_value) is not type(expected_value) or actual_value != expected_value:
+        if not _matches_query_value(name, actual_value, expected_value):
             raise ApiError(
                 "GET /api/items returned query metadata that does not match the request"
             )
@@ -218,3 +227,18 @@ def _validate_collection_envelope(payload: JsonObject, expected_query: JsonObjec
     expected_data_count = max(0, min(limit, total - ((page - 1) * limit)))
     if len(data) != expected_data_count:
         raise ApiError("GET /api/items returned data inconsistent with pagination metadata")
+
+
+def _matches_query_value(name: str, actual: Any, expected: Any) -> bool:
+    if name != "q" or not isinstance(expected, str) or expected.isascii():
+        return type(actual) is type(expected) and actual == expected
+
+    # The provider owns non-ASCII case normalization because its Unicode table
+    # can be newer than Python's. Validate the JSON primitive and stable parts
+    # of the normalized representation without predicting that table.
+    return (
+        type(actual) is str
+        and bool(actual)
+        and actual == _ecmascript_trim(actual)
+        and not any("A" <= character <= "Z" for character in actual)
+    )

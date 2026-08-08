@@ -77,6 +77,14 @@ class FakeSession:
         return self.response
 
 
+class QueryString(str):
+    pass
+
+
+class UnhashableQueryString(str):
+    __hash__ = None  # type: ignore[assignment]
+
+
 class ApiClientTests(unittest.TestCase):
     def test_health_uses_the_configured_base_url(self) -> None:
         session = FakeSession(FakeResponse({"status": "ok"}))
@@ -166,13 +174,68 @@ class ApiClientTests(unittest.TestCase):
             [("http://api.example.test/api/items", 5.0, {"page": 1, "limit": 20})],
         )
 
+    def test_discover_items_normalizes_string_subclasses_to_json_strings(self) -> None:
+        response = collection_envelope(
+            data=[],
+            query={
+                "status": "active",
+                "category": "core-service",
+                "label": "featured",
+                "q": "first",
+                "sort": "name",
+                "order": "desc",
+                "page": 1,
+                "limit": 20,
+            },
+        )
+        response["pagination"].update(total=0, totalPages=0)
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            client.discover_items(
+                status=QueryString("active"),
+                category=QueryString("core-service"),
+                label=QueryString("featured"),
+                q=QueryString("FIRST"),
+                sort=UnhashableQueryString("name"),
+                order=UnhashableQueryString("desc"),
+            ),
+            response,
+        )
+        sent_params = session.calls[0][2]
+        assert sent_params is not None
+        self.assertTrue(all(type(value) in {str, int} for value in sent_params.values()))
+
+    def test_discover_items_accepts_provider_unicode_case_normalization(self) -> None:
+        response = collection_envelope(
+            data=[],
+            query={
+                "status": None,
+                "category": None,
+                "label": None,
+                "q": "\u1c8a",
+                "sort": None,
+                "order": None,
+                "page": 1,
+                "limit": 20,
+            },
+        )
+        response["pagination"].update(total=0, totalPages=0)
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(client.discover_items(q="\u1c89"), response)
+
     def test_invalid_discovery_options_fail_before_a_request(self) -> None:
         invalid_options = (
             {"label": "  "},
             {"label": "\ufeff"},
             {"q": ""},
             {"sort": "created"},
+            {"sort": []},
             {"order": "descending"},
+            {"order": {}},
             {"order": "asc"},
             {"page": 0},
             {"page": True},
