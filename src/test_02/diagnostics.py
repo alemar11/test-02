@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sys
+from ipaddress import ip_address
 from importlib import metadata
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -18,6 +19,35 @@ JsonObject = dict[str, Any]
 
 def _failure(code: str, message: str) -> JsonObject:
     return {"status": "fail", "code": code, "message": message}
+
+
+def _normalize_hostname(value: str) -> str | None:
+    try:
+        address = ip_address(value)
+    except ValueError:
+        try:
+            hostname = value.encode("idna").decode("ascii").lower()
+        except UnicodeError:
+            return None
+
+        hostname_without_root = hostname[:-1] if hostname.endswith(".") else hostname
+        labels = hostname_without_root.split(".")
+        if (
+            not hostname_without_root
+            or len(hostname_without_root) > 253
+            or any(
+                not label
+                or len(label) > 63
+                or not label[0].isalnum()
+                or not label[-1].isalnum()
+                or any(not character.isalnum() and character != "-" for character in label)
+                for label in labels
+            )
+        ):
+            return None
+        return hostname
+    else:
+        return address.compressed
 
 
 def diagnose_base_url(value: str) -> JsonObject:
@@ -39,7 +69,11 @@ def diagnose_base_url(value: str) -> JsonObject:
     if parsed.query or parsed.fragment:
         return _failure("invalid_base_url", "base URL must not include a query or fragment")
 
-    host = hostname.lower()
+    normalized_hostname = _normalize_hostname(hostname)
+    if normalized_hostname is None or parsed.netloc.endswith(":") or port == 0:
+        return _failure("invalid_base_url", "base URL has an invalid host or port")
+
+    host = normalized_hostname
     if ":" in host:
         host = f"[{host}]"
     netloc = host if port is None else f"{host}:{port}"

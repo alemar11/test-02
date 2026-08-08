@@ -49,6 +49,25 @@ class EnvironmentReportTests(unittest.TestCase):
                 self.assertEqual(report["diagnostics"]["timeout"]["code"], "invalid_timeout")
                 self.assertEqual(report["diagnostics"]["python"]["code"], "unsupported_python")
 
+    def test_malformed_authorities_are_rejected(self) -> None:
+        for base_url in (
+            "http://%zz",
+            "http://.",
+            "http://example.com:",
+            "http://example.com\\evil",
+            "http://127.0.0.1:0",
+        ):
+            with self.subTest(base_url=base_url):
+                report = environment_report(
+                    base_url,
+                    5,
+                    python_version=(3, 13, 0),
+                    package_version="0.1.0",
+                )
+
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["diagnostics"]["base_url"]["code"], "invalid_base_url")
+
     def test_report_is_repeatable_offline_and_does_not_mutate_process_state(self) -> None:
         environment_before = os.environ.copy()
         path_before = list(os.sys.path)
