@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
     items.add_argument("--order", choices=("asc", "desc"))
     items.add_argument("--page", type=_page, default=1)
     items.add_argument("--limit", type=_limit, default=20)
+    facets = commands.add_parser("facets", help="Read item label facets")
+    facets.add_argument("--status", help="Exact status filter")
+    facets.add_argument("--category", help="Exact category filter")
+    facets.add_argument("--label", help="Exact label membership filter")
+    facets.add_argument("--q", help="Case-insensitive item name search")
     return parser
 
 
@@ -62,7 +67,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "health":
             payload = client.health()
-        else:
+        elif args.command == "items":
             payload = client.discover_items(
                 status=args.status,
                 category=args.category,
@@ -72,6 +77,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 order=args.order,
                 page=args.page,
                 limit=args.limit,
+            )
+        else:
+            payload = client.item_facets(
+                status=args.status,
+                category=args.category,
+                label=args.label,
+                q=args.q,
             )
     except ApiError as error:
         print(f"error: {error}", file=sys.stderr)

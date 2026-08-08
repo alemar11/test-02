@@ -30,6 +30,30 @@ def collection_envelope(
     }
 
 
+def facet_envelope(
+    *,
+    total: int = 2,
+    by_label: dict[str, int] | None = None,
+    filters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "data": {
+            "total": total,
+            "byLabel": by_label
+            if by_label is not None
+            else {"featured": 1, "read-only": 2, "support": 1},
+        },
+        "filters": filters
+        if filters is not None
+        else {
+            "status": None,
+            "category": None,
+            "label": None,
+            "q": None,
+        },
+    }
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -178,6 +202,68 @@ class ApiClientTests(unittest.TestCase):
             session.calls,
             [("http://api.example.test/api/items", 5.0, {"page": 1, "limit": 20})],
         )
+
+    def test_item_facets_transports_supported_filters_and_validates_metadata(self) -> None:
+        response = facet_envelope(
+            total=1,
+            by_label={"featured": 1, "read-only": 1},
+            filters={
+                "status": "active",
+                "category": "core-service",
+                "label": "featured",
+                "q": "first",
+            },
+        )
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            client.item_facets(
+                status="active",
+                category="core-service",
+                label="featured",
+                q="\ufeff FIRST \ufeff",
+            ),
+            response,
+        )
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "http://api.example.test/api/items/facets",
+                    5.0,
+                    {
+                        "status": "active",
+                        "category": "core-service",
+                        "label": "featured",
+                        "q": "\ufeff FIRST \ufeff",
+                    },
+                )
+            ],
+        )
+
+    def test_item_facets_accepts_empty_and_multi_label_results(self) -> None:
+        valid_responses = (
+            facet_envelope(total=0, by_label={}),
+            facet_envelope(
+                total=2,
+                by_label={"featured": 1, "read-only": 2, "support": 1},
+            ),
+        )
+
+        for response in valid_responses:
+            with self.subTest(response=response):
+                session = FakeSession(FakeResponse(response))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                self.assertEqual(client.item_facets(), response)
+                self.assertEqual(
+                    session.calls,
+                    [("http://api.example.test/api/items/facets", 5.0, {})],
+                )
 
     def test_discover_items_normalizes_string_subclasses_to_json_strings(self) -> None:
         response = collection_envelope(
@@ -371,6 +457,41 @@ class ApiClientTests(unittest.TestCase):
 
                 self.assertEqual(session.calls, [])
 
+    def test_invalid_and_unsupported_facet_options_fail_before_a_request(self) -> None:
+        invalid_options = (
+            {"status": ""},
+            {"category": "  "},
+            {"label": "\ufeff"},
+            {"q": "\ud800"},
+            {"status": 1},
+        )
+
+        for options in invalid_options:
+            with self.subTest(options=options):
+                session = FakeSession(FakeResponse(facet_envelope()))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "invalid facet option"):
+                    client.item_facets(**options)  # type: ignore[arg-type]
+
+                self.assertEqual(session.calls, [])
+
+        for options in ({"sort": "name"}, {"page": 1}, {"limit": 20}):
+            with self.subTest(options=options):
+                session = FakeSession(FakeResponse(facet_envelope()))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaises(TypeError):
+                    client.item_facets(**options)  # type: ignore[arg-type]
+
+                self.assertEqual(session.calls, [])
+
     def test_discover_items_rejects_incomplete_or_inconsistent_envelopes(self) -> None:
         invalid_envelopes = []
 
@@ -404,6 +525,82 @@ class ApiClientTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ApiError, "GET /api/items returned"):
                     client.discover_items()
+
+    def test_item_facets_rejects_incomplete_or_invalid_envelopes(self) -> None:
+        invalid_envelopes = []
+
+        missing_filters = facet_envelope()
+        del missing_filters["filters"]
+        invalid_envelopes.append(missing_filters)
+
+        extra_field = facet_envelope()
+        extra_field["unexpected"] = None
+        invalid_envelopes.append(extra_field)
+
+        incomplete_data = facet_envelope()
+        del incomplete_data["data"]["byLabel"]
+        invalid_envelopes.append(incomplete_data)
+
+        boolean_total = facet_envelope()
+        boolean_total["data"]["total"] = True
+        invalid_envelopes.append(boolean_total)
+
+        invalid_count = facet_envelope()
+        invalid_count["data"]["byLabel"]["featured"] = 0
+        invalid_envelopes.append(invalid_count)
+
+        boolean_count = facet_envelope()
+        boolean_count["data"]["byLabel"]["featured"] = True
+        invalid_envelopes.append(boolean_count)
+
+        incomplete_filters = facet_envelope()
+        del incomplete_filters["filters"]["category"]
+        invalid_envelopes.append(incomplete_filters)
+
+        drifted_filters = facet_envelope()
+        drifted_filters["filters"]["label"] = "unexpected"
+        invalid_envelopes.append(drifted_filters)
+
+        for envelope in invalid_envelopes:
+            with self.subTest(envelope=envelope):
+                session = FakeSession(FakeResponse(copy.deepcopy(envelope)))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "GET /api/items/facets returned"):
+                    client.item_facets()
+
+    def test_item_facets_preserves_transport_http_json_and_shape_errors(self) -> None:
+        cases = (
+            (
+                FakeSession(error=requests.ConnectionError("offline")),
+                "GET /api/items/facets transport failed",
+            ),
+            (
+                FakeSession(FakeResponse({}, status_code=422)),
+                "GET /api/items/facets returned HTTP 422",
+            ),
+            (
+                FakeSession(FakeResponse({}, json_error=ValueError("bad json"))),
+                "GET /api/items/facets returned invalid JSON",
+            ),
+            (
+                FakeSession(FakeResponse([])),
+                "GET /api/items/facets returned a non-object JSON payload",
+            ),
+        )
+
+        for session, message in cases:
+            with self.subTest(message=message):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, message):
+                    client.item_facets()
 
     def test_transport_http_json_and_top_level_shape_errors_are_distinct(self) -> None:
         cases = (

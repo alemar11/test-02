@@ -14,6 +14,7 @@ Start the API in `test-01`, then run one of these commands:
 uv run test-02 health
 uv run test-02 items
 uv run test-02 items --label featured --status active --sort name --limit 5
+uv run test-02 facets --label read-only --status active
 ```
 
 Use `--base-url` before the command to point the client at another local API
@@ -63,6 +64,7 @@ from test_02.client import ApiClient
 client = ApiClient("http://127.0.0.1:3000")
 envelope = client.discover_items(label="featured", sort="name", limit=5)
 items = client.list_items()
+facets = client.item_facets(label="read-only", status="active")
 ```
 
 `discover_items()` validates options locally before sending a request. Blank
@@ -73,15 +75,86 @@ malformed collection envelopes also have distinct `ApiError` messages.
 `list_items()` intentionally keeps the original unqueried
 `{ "data": [...] }` response compatibility and returns only the data array.
 
+## Facet insights
+
+The `facets` command and `ApiClient.item_facets()` request server-owned label
+counts over the complete matching item set. They support only `status`,
+`category`, `label`, and `q`; pagination and sorting are intentionally not
+facet controls. Exact filters are preserved, while `q` is trimmed and
+case-normalized by the provider and verified by the client.
+
+For example:
+
+```bash
+uv run test-02 facets --status active --q " ITEM "
+```
+
+prints sorted-key JSON with the complete facet envelope:
+
+```json
+{
+  "data": {
+    "byLabel": {
+      "featured": 1,
+      "read-only": 2,
+      "support": 1
+    },
+    "total": 2
+  },
+  "filters": {
+    "category": null,
+    "label": null,
+    "q": "item",
+    "status": "active"
+  }
+}
+```
+
+Each matching item contributes to every label it carries, so the sum of label
+counts can be greater than `data.total`. A query with no matches returns
+`total: 0` and an empty `byLabel` object. Blank or non-string client filters
+fail locally before a request. Transport, HTTP, invalid-JSON, top-level shape,
+facet-data, and normalized-filter mismatches remain distinct `ApiError`
+failures and use the CLI's established `error: ...` stderr contract.
+
 ## Cross-repository contract
 
-The discovery shape is tested against the label-aware `test-01` contract from
+The discovery shape remains tested against the label-aware `test-01` contract from
 [provider PR #60](https://github.com/alemar11/test-01/pull/60), verified at
 candidate `73d294e027f99e0017d971410dd05c5f67561e55`. That provider accepts scalar
 `status`, `category`, `label`, `q`, `sort`, `order`, `page`, and `limit`
 controls. Queried reads return exactly `data`, `pagination`, and the normalized
 eight-field `query` metadata object. This repository consumes that contract
 without sharing Git history with or modifying `test-01`.
+
+The facet tests mirror the separate provider contract from
+[provider PR #61](https://github.com/alemar11/test-01/pull/61), verified at
+candidate `77591b055d4ea68237f7b83978ebc144768fb3a5`. Its
+`GET /api/items/facets` response has exactly `data` and `filters`; `data` has
+`total` and `byLabel`; and `filters` records the exact `status`, `category`,
+and `label` values plus normalized `q`. The repositories stay independent:
+the provider candidate is contract evidence, never Git ancestry for test-02.
+
+To reproduce the live facet contract in an isolated provider checkout:
+
+```bash
+git clone https://github.com/alemar11/test-01.git /tmp/test-01-facet-contract
+git -C /tmp/test-01-facet-contract fetch origin pull/61/head
+git -C /tmp/test-01-facet-contract checkout --detach 77591b055d4ea68237f7b83978ebc144768fb3a5
+npm --prefix /tmp/test-01-facet-contract ci
+npm --prefix /tmp/test-01-facet-contract start
+```
+
+Then, from this repository in another shell, run the consumer against it:
+
+```bash
+uv run test-02 --base-url http://127.0.0.1:3000 facets --status active --q " ITEM "
+```
+
+The command must produce the deterministic envelope shown above. The unit
+tests exercise the same exact response keys, filter normalization, empty-map,
+multi-label, unsupported-control, and error contracts without contacting or
+changing test-01.
 
 Run the tests and syntax check with:
 

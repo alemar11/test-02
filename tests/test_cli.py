@@ -66,6 +66,53 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), json.dumps(envelope, indent=2, sort_keys=True) + "\n")
 
     @patch("test_02.cli.ApiClient")
+    def test_facets_prints_deterministic_filtered_label_counts(self, client_class) -> None:
+        envelope = {
+            "data": {
+                "total": 2,
+                "byLabel": {"support": 1, "read-only": 2, "featured": 1},
+            },
+            "filters": {
+                "status": "active",
+                "category": "core-service",
+                "label": "featured",
+                "q": "item",
+            },
+        }
+        client_class.return_value.item_facets.return_value = envelope
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "--base-url",
+                    "http://api.example.test",
+                    "facets",
+                    "--status",
+                    "active",
+                    "--category",
+                    "core-service",
+                    "--label",
+                    "featured",
+                    "--q",
+                    "ITEM",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with("http://api.example.test")
+        client_class.return_value.item_facets.assert_called_once_with(
+            status="active",
+            category="core-service",
+            label="featured",
+            q="ITEM",
+        )
+        self.assertEqual(
+            output.getvalue(),
+            json.dumps(envelope, indent=2, sort_keys=True) + "\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
     def test_health_keeps_the_existing_command_behavior(self, client_class) -> None:
         client_class.return_value.health.return_value = {"status": "ok"}
         output = io.StringIO()
@@ -110,6 +157,23 @@ class CliTests(unittest.TestCase):
         client_class.assert_not_called()
 
     @patch("test_02.cli.ApiClient")
+    def test_facets_rejects_unsupported_controls_before_client_creation(
+        self,
+        client_class,
+    ) -> None:
+        for option in (("--sort", "name"), ("--page", "1"), ("--limit", "20")):
+            with self.subTest(option=option):
+                errors = io.StringIO()
+
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+                    main(["facets", *option])
+
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("unrecognized arguments", errors.getvalue())
+
+        client_class.assert_not_called()
+
+    @patch("test_02.cli.ApiClient")
     def test_api_errors_are_reported_without_json_output(self, client_class) -> None:
         client_class.return_value.discover_items.side_effect = ApiError("transport failed")
         output = io.StringIO()
@@ -121,6 +185,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(errors.getvalue(), "error: transport failed\n")
+
+    @patch("test_02.cli.ApiClient")
+    def test_facet_errors_use_the_existing_cli_error_contract(self, client_class) -> None:
+        client_class.return_value.item_facets.side_effect = ApiError(
+            "GET /api/items/facets returned invalid facet data"
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["facets", "--label", "featured"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: GET /api/items/facets returned invalid facet data\n",
+        )
 
 
 if __name__ == "__main__":

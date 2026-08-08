@@ -19,6 +19,9 @@ _QUERY_KEYS = {
     "page",
     "limit",
 }
+_FACET_ENVELOPE_KEYS = {"data", "filters"}
+_FACET_DATA_KEYS = {"total", "byLabel"}
+_FACET_FILTER_KEYS = {"status", "category", "label", "q"}
 _SORT_FIELDS = {"id", "name", "status"}
 _SORT_ORDERS = {"asc", "desc"}
 _ECMASCRIPT_TRIM_CHARACTERS = (
@@ -193,6 +196,25 @@ class ApiClient:
         _validate_collection_envelope(payload, expected_query, normalized_queries)
         return payload
 
+    def item_facets(
+        self,
+        *,
+        status: str | None = None,
+        category: str | None = None,
+        label: str | None = None,
+        q: str | None = None,
+    ) -> JsonObject:
+        """Return validated label facets for the complete matching item set."""
+        params, expected_filters, normalized_queries = _facet_query(
+            status=status,
+            category=category,
+            label=label,
+            q=q,
+        )
+        payload = self._get("/api/items/facets", params=params)
+        _validate_facet_envelope(payload, expected_filters, normalized_queries)
+        return payload
+
     def _get(
         self,
         path: str,
@@ -299,18 +321,67 @@ def _discovery_query(
     return params, expected_query, normalized_queries
 
 
-def _canonical_query_string(name: str, value: Any) -> str | None:
+def _facet_query(
+    *,
+    status: str | None,
+    category: str | None,
+    label: str | None,
+    q: str | None,
+) -> tuple[dict[str, QueryValue], JsonObject, frozenset[str] | None]:
+    filter_values: dict[str, str | None] = {}
+    for name, value in (
+        ("status", status),
+        ("category", category),
+        ("label", label),
+        ("q", q),
+    ):
+        canonical_value = _canonical_query_string(
+            name,
+            value,
+            option_group="facet",
+        )
+        if canonical_value is not None and not _ecmascript_trim(canonical_value):
+            raise ApiError(f"invalid facet option '{name}': expected a non-blank string")
+        filter_values[name] = canonical_value
+
+    status = filter_values["status"]
+    category = filter_values["category"]
+    label = filter_values["label"]
+    q = filter_values["q"]
+    params = {
+        name: value
+        for name, value in filter_values.items()
+        if value is not None
+    }
+    normalized_queries = (
+        _compatible_query_normalizations(q) if q is not None else None
+    )
+    expected_filters: JsonObject = {
+        "status": status,
+        "category": category,
+        "label": label,
+        "q": _ecmascript_trim(q).lower() if q is not None else None,
+    }
+    return params, expected_filters, normalized_queries
+
+
+def _canonical_query_string(
+    name: str,
+    value: Any,
+    *,
+    option_group: str = "discovery",
+) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ApiError(f"invalid discovery option '{name}': expected a string")
+        raise ApiError(f"invalid {option_group} option '{name}': expected a string")
     try:
         # Calling the base implementation avoids overridden methods on a str
         # subclass and rejects surrogate code points before requests encodes them.
         return str.encode(value, "utf-8", "strict").decode("utf-8")
     except UnicodeError as error:
         raise ApiError(
-            f"invalid discovery option '{name}': expected a valid Unicode string"
+            f"invalid {option_group} option '{name}': expected a valid Unicode string"
         ) from error
 
 
@@ -436,6 +507,46 @@ def _validate_collection_envelope(
     expected_data_count = max(0, min(limit, total - ((page - 1) * limit)))
     if len(data) != expected_data_count:
         raise ApiError("GET /api/items returned data inconsistent with pagination metadata")
+
+
+def _validate_facet_envelope(
+    payload: JsonObject,
+    expected_filters: JsonObject,
+    normalized_queries: frozenset[str] | None,
+) -> None:
+    path = "GET /api/items/facets"
+    if set(payload) != _FACET_ENVELOPE_KEYS:
+        raise ApiError(f"{path} returned an invalid facet envelope")
+
+    data = payload["data"]
+    filters = payload["filters"]
+    if not isinstance(data, dict) or set(data) != _FACET_DATA_KEYS:
+        raise ApiError(f"{path} returned invalid facet data")
+    if not isinstance(filters, dict) or set(filters) != _FACET_FILTER_KEYS:
+        raise ApiError(f"{path} returned invalid filter metadata")
+
+    total = data["total"]
+    by_label = data["byLabel"]
+    if type(total) is not int or total < 0:
+        raise ApiError(f"{path} returned invalid facet total")
+    if not isinstance(by_label, dict):
+        raise ApiError(f"{path} returned invalid label counts")
+    if not all(
+        type(name) is str and type(count) is int and count > 0
+        for name, count in by_label.items()
+    ):
+        raise ApiError(f"{path} returned invalid label counts")
+
+    for name, expected_value in expected_filters.items():
+        if not _matches_query_value(
+            name,
+            filters[name],
+            expected_value,
+            normalized_queries,
+        ):
+            raise ApiError(
+                f"{path} returned filter metadata that does not match the request"
+            )
 
 
 def _matches_query_value(
