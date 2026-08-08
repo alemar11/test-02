@@ -292,6 +292,26 @@ class ApiClientTests(unittest.TestCase):
 
         self.assertEqual(client.discover_items(q="\u1c89 \u03a3"), response)
 
+    def test_discover_items_tracks_provider_case_ignorable_additions(self) -> None:
+        response = collection_envelope(
+            data=[],
+            query={
+                "status": None,
+                "category": None,
+                "label": None,
+                "q": "a\u0897\u03c2",
+                "sort": None,
+                "order": None,
+                "page": 1,
+                "limit": 20,
+            },
+        )
+        response["pagination"].update(total=0, totalPages=0)
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(client.discover_items(q="A\u0897\u03a3"), response)
+
     def test_discover_items_rejects_unrelated_unicode_query_metadata(self) -> None:
         response = collection_envelope(
             data=[],

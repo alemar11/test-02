@@ -26,13 +26,20 @@ _ECMASCRIPT_TRIM_CHARACTERS = (
     "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
     "\u2028\u2029\u202f\u205f\u3000\ufeff"
 )
+
+
+def _characters_in(*ranges: tuple[int, int]) -> frozenset[str]:
+    return frozenset(
+        chr(codepoint)
+        for start, end in ranges
+        for codepoint in range(start, end + 1)
+    )
+
+
 _UNICODE_16_LOWERCASE = {
     "\u1c89": "\u1c8a",
     "\ua7cb": "\u0264",
     "\ua7cc": "\ua7cd",
-    "\ua7ce": "\ua7cf",
-    "\ua7d2": "\ua7d3",
-    "\ua7d4": "\ua7d5",
     "\ua7da": "\ua7db",
     "\ua7dc": "\u019b",
     **{
@@ -42,17 +49,95 @@ _UNICODE_16_LOWERCASE = {
 }
 _UNICODE_17_LOWERCASE = {
     **_UNICODE_16_LOWERCASE,
+    "\ua7ce": "\ua7cf",
+    "\ua7d2": "\ua7d3",
+    "\ua7d4": "\ua7d5",
     **{
         chr(codepoint): chr(codepoint + 0x1B)
         for codepoint in range(0x16EA0, 0x16EB9)
     },
 }
-_PROVIDER_UNICODE_TABLES = tuple(
+_UNICODE_16_CASED_ADDITIONS = _characters_in(
+    (0x1C89, 0x1C8A),
+    (0xA7CB, 0xA7CD),
+    (0xA7DA, 0xA7DC),
+    (0x10D50, 0x10D65),
+    (0x10D70, 0x10D85),
+)
+_UNICODE_16_CASE_IGNORABLE_ADDITIONS = _characters_in(
+    (0x0897, 0x0897),
+    (0x10D4E, 0x10D4E),
+    (0x10D69, 0x10D6D),
+    (0x10D6F, 0x10D6F),
+    (0x10EFC, 0x10EFC),
+    (0x113BB, 0x113C0),
+    (0x113CE, 0x113CE),
+    (0x113D0, 0x113D0),
+    (0x113D2, 0x113D2),
+    (0x113E1, 0x113E2),
+    (0x11F5A, 0x11F5A),
+    (0x1611E, 0x16129),
+    (0x1612D, 0x1612F),
+    (0x16D40, 0x16D42),
+    (0x16D6B, 0x16D6C),
+    (0x1E5EE, 0x1E5EF),
+)
+_UNICODE_17_CASED_ADDITIONS = _characters_in(
+    (0x1C89, 0x1C8A),
+    (0xA7CB, 0xA7CF),
+    (0xA7D2, 0xA7D2),
+    (0xA7D4, 0xA7D4),
+    (0xA7DA, 0xA7DC),
+    (0x10D50, 0x10D65),
+    (0x10D70, 0x10D85),
+    (0x16EA0, 0x16EB8),
+    (0x16EBB, 0x16ED3),
+)
+_UNICODE_17_CASE_IGNORABLE_ADDITIONS = _characters_in(
+    (0x0897, 0x0897),
+    (0x1ACF, 0x1ADD),
+    (0x1AE0, 0x1AEB),
+    (0xA7F1, 0xA7F1),
+    (0x10D4E, 0x10D4E),
+    (0x10D69, 0x10D6D),
+    (0x10D6F, 0x10D6F),
+    (0x10EC5, 0x10EC5),
+    (0x10EFA, 0x10EFC),
+    (0x113BB, 0x113C0),
+    (0x113CE, 0x113CE),
+    (0x113D0, 0x113D0),
+    (0x113D2, 0x113D2),
+    (0x113E1, 0x113E2),
+    (0x11B60, 0x11B60),
+    (0x11B62, 0x11B64),
+    (0x11B66, 0x11B66),
+    (0x11DD9, 0x11DD9),
+    (0x11F5A, 0x11F5A),
+    (0x1611E, 0x16129),
+    (0x1612D, 0x1612F),
+    (0x16D40, 0x16D42),
+    (0x16D6B, 0x16D6C),
+    (0x16FF2, 0x16FF3),
+    (0x1E5EE, 0x1E5EF),
+    (0x1E6E3, 0x1E6E3),
+    (0x1E6E6, 0x1E6E6),
+    (0x1E6EE, 0x1E6EF),
+    (0x1E6F5, 0x1E6F5),
+    (0x1E6FF, 0x1E6FF),
+)
+_PROVIDER_UNICODE_TABLES = (
     (
-        lowercase_mappings,
-        frozenset(lowercase_mappings) | frozenset(lowercase_mappings.values()),
-    )
-    for lowercase_mappings in (_UNICODE_16_LOWERCASE, _UNICODE_17_LOWERCASE)
+        _UNICODE_16_LOWERCASE,
+        _UNICODE_16_CASED_ADDITIONS,
+        _UNICODE_16_CASE_IGNORABLE_ADDITIONS,
+        frozenset("\U0001171e"),
+    ),
+    (
+        _UNICODE_17_LOWERCASE,
+        _UNICODE_17_CASED_ADDITIONS,
+        _UNICODE_17_CASE_IGNORABLE_ADDITIONS,
+        frozenset("\u0295\U0001171e"),
+    ),
 )
 
 
@@ -236,9 +321,9 @@ def _ecmascript_trim(value: str) -> str:
 def _compatible_query_normalizations(value: str) -> frozenset[str]:
     trimmed_value = _ecmascript_trim(value)
     normalizations = {trimmed_value.lower()}
-    for mappings, cased_characters in _PROVIDER_UNICODE_TABLES:
+    for table in _PROVIDER_UNICODE_TABLES:
         normalizations.add(
-            _provider_unicode_lower(trimmed_value, mappings, cased_characters)
+            _provider_unicode_lower(trimmed_value, *table)
         )
     return frozenset(normalizations)
 
@@ -246,7 +331,9 @@ def _compatible_query_normalizations(value: str) -> frozenset[str]:
 def _provider_unicode_lower(
     value: str,
     lowercase_mappings: dict[str, str],
-    cased_characters: frozenset[str],
+    cased_additions: frozenset[str],
+    case_ignorable_additions: frozenset[str],
+    context_removals: frozenset[str],
 ) -> str:
     # Python and supported provider runtimes ship different Unicode tables. A
     # same-length shadow keeps ECMAScript's context-sensitive final-sigma
@@ -255,9 +342,14 @@ def _provider_unicode_lower(
         character
         if character == "\u03a3"
         else "A"
-        if _is_cased(character, cased_characters)
+        if _is_cased(character, cased_additions, context_removals)
         else "\u0301"
-        if _is_case_ignorable(character, cased_characters)
+        if _is_case_ignorable(
+            character,
+            cased_additions,
+            case_ignorable_additions,
+            context_removals,
+        )
         else "!"
         for character in value
     ).lower()
@@ -269,15 +361,29 @@ def _provider_unicode_lower(
     )
 
 
-def _is_cased(character: str, cased_characters: frozenset[str]) -> bool:
-    return character in cased_characters or character.lower() != character.upper()
+def _is_cased(
+    character: str,
+    cased_additions: frozenset[str],
+    context_removals: frozenset[str],
+) -> bool:
+    if character in context_removals:
+        return False
+    if character in cased_additions:
+        return True
+    return ("A\u03a3" + character + "!").lower().startswith("a\u03c3")
 
 
 def _is_case_ignorable(
     character: str,
-    cased_characters: frozenset[str],
+    cased_additions: frozenset[str],
+    case_ignorable_additions: frozenset[str],
+    context_removals: frozenset[str],
 ) -> bool:
-    if _is_cased(character, cased_characters):
+    if character in context_removals:
+        return False
+    if character in case_ignorable_additions:
+        return True
+    if _is_cased(character, cased_additions, context_removals):
         return False
     return ("A" + character + "\u03a3").lower().endswith("\u03c2")
 
