@@ -58,6 +58,8 @@ class EnvironmentReportTests(unittest.TestCase):
             "http://127.0.0.1:0",
             "http://[v1.foo]",
             "http://☃.com",
+            "http://example.test/%zz",
+            "http://example.test/\x00",
         ):
             with self.subTest(base_url=base_url):
                 report = environment_report(

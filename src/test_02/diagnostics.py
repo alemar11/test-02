@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import string
 import sys
 from importlib import metadata
 from typing import Any
@@ -22,10 +23,30 @@ def _failure(code: str, message: str) -> JsonObject:
     return {"status": "fail", "code": code, "message": message}
 
 
+def _has_invalid_percent_escape(value: str) -> bool:
+    for index, character in enumerate(value):
+        if character == "%" and (
+            index + 2 >= len(value)
+            or value[index + 1] not in string.hexdigits
+            or value[index + 2] not in string.hexdigits
+        ):
+            return True
+    return False
+
+
 def diagnose_base_url(value: str) -> JsonObject:
     """Validate and normalize an HTTP(S) base URL without contacting it."""
-    if not isinstance(value, str) or not value or any(character.isspace() for character in value):
-        return _failure("invalid_base_url", "base URL must be a non-empty URL without whitespace")
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+        or "\\" in value
+        or _has_invalid_percent_escape(value)
+    ):
+        return _failure("invalid_base_url", "base URL contains invalid characters or escaping")
 
     try:
         parsed = urlsplit(value)
