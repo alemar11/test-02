@@ -553,6 +553,24 @@ class ApiClientTests(unittest.TestCase):
         boolean_count["data"]["byLabel"]["featured"] = True
         invalid_envelopes.append(boolean_count)
 
+        count_above_total = facet_envelope(
+            total=1,
+            by_label={"featured": 2},
+        )
+        invalid_envelopes.append(count_above_total)
+
+        counts_below_total = facet_envelope(
+            total=2,
+            by_label={"featured": 1},
+        )
+        invalid_envelopes.append(counts_below_total)
+
+        labels_for_zero_matches = facet_envelope(
+            total=0,
+            by_label={"featured": 1},
+        )
+        invalid_envelopes.append(labels_for_zero_matches)
+
         incomplete_filters = facet_envelope()
         del incomplete_filters["filters"]["category"]
         invalid_envelopes.append(incomplete_filters)
@@ -571,6 +589,25 @@ class ApiClientTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ApiError, "GET /api/items/facets returned"):
                     client.item_facets()
+
+        missing_requested_label = facet_envelope(
+            total=1,
+            by_label={"read-only": 1},
+            filters={
+                "status": None,
+                "category": None,
+                "label": "featured",
+                "q": None,
+            },
+        )
+        session = FakeSession(FakeResponse(missing_requested_label))
+        client = ApiClient(
+            "http://api.example.test",
+            session=session,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(ApiError, "inconsistent with the request"):
+            client.item_facets(label="featured")
 
     def test_item_facets_preserves_transport_http_json_and_shape_errors(self) -> None:
         cases = (

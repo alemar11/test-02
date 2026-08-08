@@ -536,6 +536,17 @@ def _validate_facet_envelope(
         for name, count in by_label.items()
     ):
         raise ApiError(f"{path} returned invalid label counts")
+    counts = tuple(by_label.values())
+    if any(count > total for count in counts) or sum(counts) < total:
+        raise ApiError(f"{path} returned label counts inconsistent with the total")
+
+    requested_label = expected_filters["label"]
+    if (
+        requested_label is not None
+        and total > 0
+        and by_label.get(requested_label) != total
+    ):
+        raise ApiError(f"{path} returned label counts inconsistent with the request")
 
     for name, expected_value in expected_filters.items():
         if not _matches_query_value(
