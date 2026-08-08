@@ -1,3 +1,4 @@
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -124,29 +125,28 @@ def _discovery_query(
     page: int,
     limit: int,
 ) -> tuple[dict[str, QueryValue], JsonObject]:
+    filter_values: dict[str, str | None] = {}
     for name, value in (
         ("status", status),
         ("category", category),
         ("label", label),
         ("q", q),
     ):
-        if value is not None and (
-            not isinstance(value, str) or not _ecmascript_trim(value)
-        ):
+        canonical_value = _canonical_query_string(name, value)
+        if canonical_value is not None and not _ecmascript_trim(canonical_value):
             raise ApiError(f"invalid discovery option '{name}': expected a non-blank string")
+        filter_values[name] = canonical_value
 
-    status = str(status) if status is not None else None
-    category = str(category) if category is not None else None
-    label = str(label) if label is not None else None
-    q = str(q) if q is not None else None
-    sort = str(sort) if isinstance(sort, str) else sort
-    order = str(order) if isinstance(order, str) else order
+    status = filter_values["status"]
+    category = filter_values["category"]
+    label = filter_values["label"]
+    q = filter_values["q"]
+    sort = _canonical_query_string("sort", sort)
+    order = _canonical_query_string("order", order)
 
-    if sort is not None and (not isinstance(sort, str) or sort not in _SORT_FIELDS):
+    if sort is not None and sort not in _SORT_FIELDS:
         raise ApiError("invalid discovery option 'sort': expected id, name, or status")
-    if order is not None and (
-        not isinstance(order, str) or order not in _SORT_ORDERS
-    ):
+    if order is not None and order not in _SORT_ORDERS:
         raise ApiError("invalid discovery option 'order': expected asc or desc")
     if order is not None and sort is None:
         raise ApiError("invalid discovery option 'order': requires 'sort'")
@@ -182,6 +182,21 @@ def _discovery_query(
         "limit": limit,
     }
     return params, expected_query
+
+
+def _canonical_query_string(name: str, value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(f"invalid discovery option '{name}': expected a string")
+    try:
+        # Calling the base implementation avoids overridden methods on a str
+        # subclass and rejects surrogate code points before requests encodes them.
+        return str.encode(value, "utf-8", "strict").decode("utf-8")
+    except UnicodeError as error:
+        raise ApiError(
+            f"invalid discovery option '{name}': expected a valid Unicode string"
+        ) from error
 
 
 def _ecmascript_trim(value: str) -> str:
@@ -230,15 +245,17 @@ def _validate_collection_envelope(payload: JsonObject, expected_query: JsonObjec
 
 
 def _matches_query_value(name: str, actual: Any, expected: Any) -> bool:
-    if name != "q" or not isinstance(expected, str) or expected.isascii():
+    if name != "q" or not isinstance(expected, str):
         return type(actual) is type(expected) and actual == expected
 
-    # The provider owns non-ASCII case normalization because its Unicode table
-    # can be newer than Python's. Validate the JSON primitive and stable parts
-    # of the normalized representation without predicting that table.
-    return (
-        type(actual) is str
-        and bool(actual)
-        and actual == _ecmascript_trim(actual)
-        and not any("A" <= character <= "Z" for character in actual)
+    if type(actual) is not str or len(actual) != len(expected):
+        return False
+
+    # ECMAScript runtimes can use a newer Unicode table than Python. Keep every
+    # known normalized character exact and permit drift only at the same
+    # positions as code points this Python runtime does not know yet.
+    return all(
+        actual_character == expected_character
+        or unicodedata.category(expected_character) == "Cn"
+        for actual_character, expected_character in zip(actual, expected, strict=True)
     )

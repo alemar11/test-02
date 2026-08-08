@@ -85,6 +85,11 @@ class UnhashableQueryString(str):
     __hash__ = None  # type: ignore[assignment]
 
 
+class MisleadingQueryString(str):
+    def strip(self, chars: str | None = None) -> str:
+        return "not blank"
+
+
 class ApiClientTests(unittest.TestCase):
     def test_health_uses_the_configured_base_url(self) -> None:
         session = FakeSession(FakeResponse({"status": "ok"}))
@@ -227,11 +232,34 @@ class ApiClientTests(unittest.TestCase):
 
         self.assertEqual(client.discover_items(q="\u1c89"), response)
 
+    def test_discover_items_rejects_unrelated_unicode_query_metadata(self) -> None:
+        response = collection_envelope(
+            data=[],
+            query={
+                "status": None,
+                "category": None,
+                "label": None,
+                "q": "wrong",
+                "sort": None,
+                "order": None,
+                "page": 1,
+                "limit": 20,
+            },
+        )
+        response["pagination"].update(total=0, totalPages=0)
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(ApiError, "query metadata"):
+            client.discover_items(q="\u00e9")
+
     def test_invalid_discovery_options_fail_before_a_request(self) -> None:
         invalid_options = (
             {"label": "  "},
             {"label": "\ufeff"},
+            {"label": MisleadingQueryString(" ")},
             {"q": ""},
+            {"q": "\ud800"},
             {"sort": "created"},
             {"sort": []},
             {"order": "descending"},
