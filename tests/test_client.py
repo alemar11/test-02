@@ -252,6 +252,46 @@ class ApiClientTests(unittest.TestCase):
 
         self.assertEqual(client.discover_items(q="\u1c89\u03a3"), response)
 
+    def test_discover_items_accepts_intermediate_provider_unicode_table(self) -> None:
+        response = collection_envelope(
+            data=[],
+            query={
+                "status": None,
+                "category": None,
+                "label": None,
+                "q": "\u1c8a\U00016ea0",
+                "sort": None,
+                "order": None,
+                "page": 1,
+                "limit": 20,
+            },
+        )
+        response["pagination"].update(total=0, totalPages=0)
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(client.discover_items(q="\u1c89\U00016ea0"), response)
+
+    def test_discover_items_preserves_provider_final_sigma_boundaries(self) -> None:
+        response = collection_envelope(
+            data=[],
+            query={
+                "status": None,
+                "category": None,
+                "label": None,
+                "q": "\u1c8a \u03c3",
+                "sort": None,
+                "order": None,
+                "page": 1,
+                "limit": 20,
+            },
+        )
+        response["pagination"].update(total=0, totalPages=0)
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(client.discover_items(q="\u1c89 \u03a3"), response)
+
     def test_discover_items_rejects_unrelated_unicode_query_metadata(self) -> None:
         response = collection_envelope(
             data=[],

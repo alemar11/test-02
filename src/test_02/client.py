@@ -26,7 +26,7 @@ _ECMASCRIPT_TRIM_CHARACTERS = (
     "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
     "\u2028\u2029\u202f\u205f\u3000\ufeff"
 )
-_NEWER_UNICODE_LOWERCASE = {
+_UNICODE_16_LOWERCASE = {
     "\u1c89": "\u1c8a",
     "\ua7cb": "\u0264",
     "\ua7cc": "\ua7cd",
@@ -39,13 +39,20 @@ _NEWER_UNICODE_LOWERCASE = {
         chr(codepoint): chr(codepoint + 0x20)
         for codepoint in range(0x10D50, 0x10D66)
     },
+}
+_UNICODE_17_LOWERCASE = {
+    **_UNICODE_16_LOWERCASE,
     **{
         chr(codepoint): chr(codepoint + 0x1B)
         for codepoint in range(0x16EA0, 0x16EB9)
     },
 }
-_NEWER_UNICODE_CASED = frozenset(_NEWER_UNICODE_LOWERCASE) | frozenset(
-    _NEWER_UNICODE_LOWERCASE.values()
+_PROVIDER_UNICODE_TABLES = tuple(
+    (
+        lowercase_mappings,
+        frozenset(lowercase_mappings) | frozenset(lowercase_mappings.values()),
+    )
+    for lowercase_mappings in (_UNICODE_16_LOWERCASE, _UNICODE_17_LOWERCASE)
 )
 
 
@@ -228,37 +235,49 @@ def _ecmascript_trim(value: str) -> str:
 
 def _compatible_query_normalizations(value: str) -> frozenset[str]:
     trimmed_value = _ecmascript_trim(value)
-    return frozenset((trimmed_value.lower(), _newer_unicode_lower(trimmed_value)))
+    normalizations = {trimmed_value.lower()}
+    for mappings, cased_characters in _PROVIDER_UNICODE_TABLES:
+        normalizations.add(
+            _provider_unicode_lower(trimmed_value, mappings, cased_characters)
+        )
+    return frozenset(normalizations)
 
 
-def _newer_unicode_lower(value: str) -> str:
-    # Python and the provider can ship different Unicode tables. The provider's
-    # newer mappings are finite, and a same-length shadow lets Python retain
-    # ECMAScript's context-sensitive final-sigma behavior around those mappings.
+def _provider_unicode_lower(
+    value: str,
+    lowercase_mappings: dict[str, str],
+    cased_characters: frozenset[str],
+) -> str:
+    # Python and supported provider runtimes ship different Unicode tables. A
+    # same-length shadow keeps ECMAScript's context-sensitive final-sigma
+    # behavior aligned with each finite mapping table.
     shadow = "".join(
         character
         if character == "\u03a3"
         else "A"
-        if _is_cased(character)
+        if _is_cased(character, cased_characters)
         else "\u0301"
-        if _is_case_ignorable(character)
-        else "."
+        if _is_case_ignorable(character, cased_characters)
+        else "!"
         for character in value
     ).lower()
     return "".join(
         shadow[index]
         if character == "\u03a3"
-        else _NEWER_UNICODE_LOWERCASE.get(character, character.lower())
+        else lowercase_mappings.get(character, character.lower())
         for index, character in enumerate(value)
     )
 
 
-def _is_cased(character: str) -> bool:
-    return character in _NEWER_UNICODE_CASED or character.lower() != character.upper()
+def _is_cased(character: str, cased_characters: frozenset[str]) -> bool:
+    return character in cased_characters or character.lower() != character.upper()
 
 
-def _is_case_ignorable(character: str) -> bool:
-    if _is_cased(character):
+def _is_case_ignorable(
+    character: str,
+    cased_characters: frozenset[str],
+) -> bool:
+    if _is_cased(character, cased_characters):
         return False
     return ("A" + character + "\u03a3").lower().endswith("\u03c2")
 
