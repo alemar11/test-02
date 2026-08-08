@@ -80,7 +80,7 @@ def diagnose_base_url(value: str) -> JsonObject:
         return _failure("invalid_base_url", "base URL must use http or https and include a host")
     if parsed.username is not None or parsed.password is not None:
         return _failure("invalid_base_url", "base URL must not include credentials")
-    if parsed.query or parsed.fragment:
+    if "?" in value or "#" in value:
         return _failure("invalid_base_url", "base URL must not include a query or fragment")
 
     if parsed.netloc.endswith(":") or port == 0:
@@ -110,7 +110,7 @@ def diagnose_timeout(value: object) -> JsonObject:
     """Validate a finite, positive request timeout."""
     try:
         timeout = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return _failure("invalid_timeout", "timeout must be a finite positive number")
 
     if isinstance(value, bool) or not math.isfinite(timeout) or timeout <= 0:

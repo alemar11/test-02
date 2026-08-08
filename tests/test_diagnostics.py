@@ -64,6 +64,8 @@ class EnvironmentReportTests(unittest.TestCase):
             "http://-example.test",
             "http://example-.test",
             "http://example_test",
+            "http://example.test?",
+            "http://example.test#",
         ):
             with self.subTest(base_url=base_url):
                 report = environment_report(
@@ -75,6 +77,17 @@ class EnvironmentReportTests(unittest.TestCase):
 
                 self.assertFalse(report["ok"])
                 self.assertEqual(report["diagnostics"]["base_url"]["code"], "invalid_base_url")
+
+    def test_nonrepresentable_timeout_is_an_explicit_failure(self) -> None:
+        report = environment_report(
+            "http://example.test",
+            10**400,
+            python_version=(3, 13, 0),
+            package_version="0.1.0",
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["diagnostics"]["timeout"]["code"], "invalid_timeout")
 
     def test_non_ascii_hostname_uses_the_client_idna_normalization(self) -> None:
         report = environment_report(
