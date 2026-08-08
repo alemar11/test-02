@@ -5,6 +5,7 @@ import requests
 
 JsonObject = dict[str, Any]
 QueryValue = str | int
+MAX_PAGE = 9_007_199_254_740_991
 
 _COLLECTION_KEYS = {"data", "pagination", "query"}
 _PAGINATION_KEYS = {"page", "limit", "total", "totalPages"}
@@ -20,6 +21,11 @@ _QUERY_KEYS = {
 }
 _SORT_FIELDS = {"id", "name", "status"}
 _SORT_ORDERS = {"asc", "desc"}
+_ECMASCRIPT_TRIM_CHARACTERS = (
+    "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
 
 
 class ApiError(RuntimeError):
@@ -124,7 +130,9 @@ def _discovery_query(
         ("label", label),
         ("q", q),
     ):
-        if value is not None and (not isinstance(value, str) or not value.strip()):
+        if value is not None and (
+            not isinstance(value, str) or not _ecmascript_trim(value)
+        ):
             raise ApiError(f"invalid discovery option '{name}': expected a non-blank string")
 
     if sort is not None and sort not in _SORT_FIELDS:
@@ -133,8 +141,10 @@ def _discovery_query(
         raise ApiError("invalid discovery option 'order': expected asc or desc")
     if order is not None and sort is None:
         raise ApiError("invalid discovery option 'order': requires 'sort'")
-    if type(page) is not int or page < 1:
-        raise ApiError("invalid discovery option 'page': expected a positive integer")
+    if type(page) is not int or not 1 <= page <= MAX_PAGE:
+        raise ApiError(
+            f"invalid discovery option 'page': expected an integer from 1 to {MAX_PAGE}"
+        )
     if type(limit) is not int or not 1 <= limit <= 100:
         raise ApiError("invalid discovery option 'limit': expected an integer from 1 to 100")
 
@@ -156,13 +166,17 @@ def _discovery_query(
         "status": status,
         "category": category,
         "label": label,
-        "q": q.strip().lower() if q is not None else None,
+        "q": _ecmascript_trim(q).lower() if q is not None else None,
         "sort": sort,
         "order": (order or "asc") if sort is not None else None,
         "page": page,
         "limit": limit,
     }
     return params, expected_query
+
+
+def _ecmascript_trim(value: str) -> str:
+    return value.strip(_ECMASCRIPT_TRIM_CHARACTERS)
 
 
 def _validate_collection_envelope(payload: JsonObject, expected_query: JsonObject) -> None:

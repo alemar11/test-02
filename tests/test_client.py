@@ -4,7 +4,7 @@ from typing import Any
 
 import requests
 
-from test_02.client import ApiClient, ApiError
+from test_02.client import MAX_PAGE, ApiClient, ApiError
 
 
 def collection_envelope(
@@ -127,7 +127,7 @@ class ApiClientTests(unittest.TestCase):
                 status="active",
                 category="core-service",
                 label="featured",
-                q=" FIRST ",
+                q="\ufeff FIRST \ufeff",
                 sort="name",
                 order="desc",
                 page=1,
@@ -145,7 +145,7 @@ class ApiClientTests(unittest.TestCase):
                         "status": "active",
                         "category": "core-service",
                         "label": "featured",
-                        "q": " FIRST ",
+                        "q": "\ufeff FIRST \ufeff",
                         "sort": "name",
                         "order": "desc",
                         "page": 1,
@@ -169,12 +169,14 @@ class ApiClientTests(unittest.TestCase):
     def test_invalid_discovery_options_fail_before_a_request(self) -> None:
         invalid_options = (
             {"label": "  "},
+            {"label": "\ufeff"},
             {"q": ""},
             {"sort": "created"},
             {"order": "descending"},
             {"order": "asc"},
             {"page": 0},
             {"page": True},
+            {"page": MAX_PAGE + 1},
             {"limit": 101},
         )
 

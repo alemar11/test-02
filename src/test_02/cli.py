@@ -3,7 +3,7 @@ import json
 import sys
 from collections.abc import Sequence
 
-from .client import ApiClient, ApiError
+from .client import MAX_PAGE, ApiClient, ApiError
 
 
 def _positive_int(value: str) -> int:
@@ -23,6 +23,13 @@ def _limit(value: str) -> int:
     return parsed
 
 
+def _page(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > MAX_PAGE:
+        raise argparse.ArgumentTypeError(f"expected an integer from 1 to {MAX_PAGE}")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read data from test-01")
     parser.add_argument(
@@ -39,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     items.add_argument("--q", help="Case-insensitive item name search")
     items.add_argument("--sort", choices=("id", "name", "status"))
     items.add_argument("--order", choices=("asc", "desc"))
-    items.add_argument("--page", type=_positive_int, default=1)
+    items.add_argument("--page", type=_page, default=1)
     items.add_argument("--limit", type=_limit, default=20)
     return parser
 

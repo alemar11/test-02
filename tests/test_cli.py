@@ -99,6 +99,17 @@ class CliTests(unittest.TestCase):
         client_class.assert_not_called()
 
     @patch("test_02.cli.ApiClient")
+    def test_unsafe_page_is_rejected_before_client_creation(self, client_class) -> None:
+        errors = io.StringIO()
+
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+            main(["items", "--page", "9007199254740992"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("expected an integer from 1 to 9007199254740991", errors.getvalue())
+        client_class.assert_not_called()
+
+    @patch("test_02.cli.ApiClient")
     def test_api_errors_are_reported_without_json_output(self, client_class) -> None:
         client_class.return_value.discover_items.side_effect = ApiError("transport failed")
         output = io.StringIO()

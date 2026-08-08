@@ -66,10 +66,11 @@ items = client.list_items()
 ```
 
 `discover_items()` validates options locally before sending a request. Blank
-filters, unsupported sorting, an order without a sort, non-positive pages, and
-limits outside 1 through 100 raise `ApiError`. Transport failures, HTTP errors,
-invalid JSON, and malformed collection envelopes also have distinct `ApiError`
-messages. `list_items()` intentionally keeps the original unqueried
+filters, unsupported sorting, an order without a sort, pages outside 1 through
+JavaScript's maximum safe integer (`9007199254740991`), and limits outside 1
+through 100 raise `ApiError`. Transport failures, HTTP errors, invalid JSON, and
+malformed collection envelopes also have distinct `ApiError` messages.
+`list_items()` intentionally keeps the original unqueried
 `{ "data": [...] }` response compatibility and returns only the data array.
 
 ## Cross-repository contract
