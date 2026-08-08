@@ -232,6 +232,26 @@ class ApiClientTests(unittest.TestCase):
 
         self.assertEqual(client.discover_items(q="\u1c89"), response)
 
+    def test_discover_items_accepts_contextual_provider_case_normalization(self) -> None:
+        response = collection_envelope(
+            data=[],
+            query={
+                "status": None,
+                "category": None,
+                "label": None,
+                "q": "\u1c8a\u03c2",
+                "sort": None,
+                "order": None,
+                "page": 1,
+                "limit": 20,
+            },
+        )
+        response["pagination"].update(total=0, totalPages=0)
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(client.discover_items(q="\u1c89\u03a3"), response)
+
     def test_discover_items_rejects_unrelated_unicode_query_metadata(self) -> None:
         response = collection_envelope(
             data=[],
@@ -252,6 +272,13 @@ class ApiClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ApiError, "query metadata"):
             client.discover_items(q="\u00e9")
+
+        response["query"]["q"] = "x"
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(ApiError, "query metadata"):
+            client.discover_items(q="\u0378")
 
     def test_invalid_discovery_options_fail_before_a_request(self) -> None:
         invalid_options = (

@@ -1,4 +1,3 @@
-import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +25,27 @@ _ECMASCRIPT_TRIM_CHARACTERS = (
     "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680"
     "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
     "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+_NEWER_UNICODE_LOWERCASE = {
+    "\u1c89": "\u1c8a",
+    "\ua7cb": "\u0264",
+    "\ua7cc": "\ua7cd",
+    "\ua7ce": "\ua7cf",
+    "\ua7d2": "\ua7d3",
+    "\ua7d4": "\ua7d5",
+    "\ua7da": "\ua7db",
+    "\ua7dc": "\u019b",
+    **{
+        chr(codepoint): chr(codepoint + 0x20)
+        for codepoint in range(0x10D50, 0x10D66)
+    },
+    **{
+        chr(codepoint): chr(codepoint + 0x1B)
+        for codepoint in range(0x16EA0, 0x16EB9)
+    },
+}
+_NEWER_UNICODE_CASED = frozenset(_NEWER_UNICODE_LOWERCASE) | frozenset(
+    _NEWER_UNICODE_LOWERCASE.values()
 )
 
 
@@ -67,7 +87,7 @@ class ApiClient:
         limit: int = 20,
     ) -> JsonObject:
         """Return a validated collection envelope for an item discovery query."""
-        params, expected_query = _discovery_query(
+        params, expected_query, normalized_queries = _discovery_query(
             status=status,
             category=category,
             label=label,
@@ -78,7 +98,7 @@ class ApiClient:
             limit=limit,
         )
         payload = self._get("/api/items", params=params)
-        _validate_collection_envelope(payload, expected_query)
+        _validate_collection_envelope(payload, expected_query, normalized_queries)
         return payload
 
     def _get(
@@ -124,7 +144,7 @@ def _discovery_query(
     order: str | None,
     page: int,
     limit: int,
-) -> tuple[dict[str, QueryValue], JsonObject]:
+) -> tuple[dict[str, QueryValue], JsonObject, frozenset[str] | None]:
     filter_values: dict[str, str | None] = {}
     for name, value in (
         ("status", status),
@@ -171,6 +191,9 @@ def _discovery_query(
     params["page"] = page
     params["limit"] = limit
 
+    normalized_queries = (
+        _compatible_query_normalizations(q) if q is not None else None
+    )
     expected_query: JsonObject = {
         "status": status,
         "category": category,
@@ -181,7 +204,7 @@ def _discovery_query(
         "page": page,
         "limit": limit,
     }
-    return params, expected_query
+    return params, expected_query, normalized_queries
 
 
 def _canonical_query_string(name: str, value: Any) -> str | None:
@@ -203,7 +226,48 @@ def _ecmascript_trim(value: str) -> str:
     return value.strip(_ECMASCRIPT_TRIM_CHARACTERS)
 
 
-def _validate_collection_envelope(payload: JsonObject, expected_query: JsonObject) -> None:
+def _compatible_query_normalizations(value: str) -> frozenset[str]:
+    trimmed_value = _ecmascript_trim(value)
+    return frozenset((trimmed_value.lower(), _newer_unicode_lower(trimmed_value)))
+
+
+def _newer_unicode_lower(value: str) -> str:
+    # Python and the provider can ship different Unicode tables. The provider's
+    # newer mappings are finite, and a same-length shadow lets Python retain
+    # ECMAScript's context-sensitive final-sigma behavior around those mappings.
+    shadow = "".join(
+        character
+        if character == "\u03a3"
+        else "A"
+        if _is_cased(character)
+        else "\u0301"
+        if _is_case_ignorable(character)
+        else "."
+        for character in value
+    ).lower()
+    return "".join(
+        shadow[index]
+        if character == "\u03a3"
+        else _NEWER_UNICODE_LOWERCASE.get(character, character.lower())
+        for index, character in enumerate(value)
+    )
+
+
+def _is_cased(character: str) -> bool:
+    return character in _NEWER_UNICODE_CASED or character.lower() != character.upper()
+
+
+def _is_case_ignorable(character: str) -> bool:
+    if _is_cased(character):
+        return False
+    return ("A" + character + "\u03a3").lower().endswith("\u03c2")
+
+
+def _validate_collection_envelope(
+    payload: JsonObject,
+    expected_query: JsonObject,
+    normalized_queries: frozenset[str] | None,
+) -> None:
     if set(payload) != _COLLECTION_KEYS:
         raise ApiError("GET /api/items returned an invalid collection envelope")
 
@@ -218,7 +282,12 @@ def _validate_collection_envelope(payload: JsonObject, expected_query: JsonObjec
         raise ApiError("GET /api/items returned invalid query metadata")
     for name, expected_value in expected_query.items():
         actual_value = query[name]
-        if not _matches_query_value(name, actual_value, expected_value):
+        if not _matches_query_value(
+            name,
+            actual_value,
+            expected_value,
+            normalized_queries,
+        ):
             raise ApiError(
                 "GET /api/items returned query metadata that does not match the request"
             )
@@ -244,18 +313,12 @@ def _validate_collection_envelope(payload: JsonObject, expected_query: JsonObjec
         raise ApiError("GET /api/items returned data inconsistent with pagination metadata")
 
 
-def _matches_query_value(name: str, actual: Any, expected: Any) -> bool:
-    if name != "q" or not isinstance(expected, str):
-        return type(actual) is type(expected) and actual == expected
-
-    if type(actual) is not str or len(actual) != len(expected):
-        return False
-
-    # ECMAScript runtimes can use a newer Unicode table than Python. Keep every
-    # known normalized character exact and permit drift only at the same
-    # positions as code points this Python runtime does not know yet.
-    return all(
-        actual_character == expected_character
-        or unicodedata.category(expected_character) == "Cn"
-        for actual_character, expected_character in zip(actual, expected, strict=True)
-    )
+def _matches_query_value(
+    name: str,
+    actual: Any,
+    expected: Any,
+    normalized_queries: frozenset[str] | None,
+) -> bool:
+    if name == "q" and normalized_queries is not None:
+        return type(actual) is str and actual in normalized_queries
+    return type(actual) is type(expected) and actual == expected
