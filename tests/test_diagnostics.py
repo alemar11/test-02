@@ -56,6 +56,8 @@ class EnvironmentReportTests(unittest.TestCase):
             "http://example.com:",
             "http://example.com\\evil",
             "http://127.0.0.1:0",
+            "http://[v1.foo]",
+            "http://☃.com",
         ):
             with self.subTest(base_url=base_url):
                 report = environment_report(
@@ -67,6 +69,17 @@ class EnvironmentReportTests(unittest.TestCase):
 
                 self.assertFalse(report["ok"])
                 self.assertEqual(report["diagnostics"]["base_url"]["code"], "invalid_base_url")
+
+    def test_non_ascii_hostname_uses_the_client_idna_normalization(self) -> None:
+        report = environment_report(
+            "http://faß.de/",
+            5,
+            python_version=(3, 13, 0),
+            package_version="0.1.0",
+        )
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["diagnostics"]["base_url"]["value"], "http://xn--fa-hia.de")
 
     def test_report_is_repeatable_offline_and_does_not_mutate_process_state(self) -> None:
         environment_before = os.environ.copy()
