@@ -12,6 +12,7 @@ Start the API in `test-01`, then run one of these commands:
 
 ```bash
 uv run test-02 health
+uv run test-02 capabilities
 uv run test-02 items
 uv run test-02 items --label featured --status active --sort name --limit 5
 uv run test-02 facets --label read-only --status active
@@ -62,6 +63,7 @@ existing data-only convenience method:
 from test_02.client import ApiClient
 
 client = ApiClient("http://127.0.0.1:3000")
+manifest = client.capabilities()
 envelope = client.discover_items(label="featured", sort="name", limit=5)
 items = client.list_items()
 facets = client.item_facets(label="read-only", status="active")
@@ -74,6 +76,24 @@ through 100 raise `ApiError`. Transport failures, HTTP errors, invalid JSON, and
 malformed collection envelopes also have distinct `ApiError` messages.
 `list_items()` intentionally keeps the original unqueried
 `{ "data": [...] }` response compatibility and returns only the data array.
+
+## Capability discovery
+
+The fixed `capabilities` command and `ApiClient.capabilities()` read
+`GET /api/capabilities` on every invocation. They accept provider schema
+version `1` only and validate the unique capability identities plus the
+required consumer contract for health, item collection, item facets, and
+capability discovery. Required methods, paths, filter behavior, sorting,
+normalization, defaults, pagination range, and result limit must remain
+compatible.
+
+Compatibility is subset-based: new capability IDs and fields are preserved in
+the returned manifest and printed output. Missing or duplicate identities,
+malformed entries, incompatible required semantics, unsupported schemas,
+transport or HTTP failures, and invalid JSON fail closed with `ApiError`.
+Discovery is never inferred from another endpoint and has no cache or stale
+fallback. The CLI prints sorted-key JSON on success; failures print only the
+established `error: ...` stderr line and exit with status `1`.
 
 ## Offline environment diagnostics
 
@@ -135,6 +155,32 @@ facet-data, and normalized-filter mismatches remain distinct `ApiError`
 failures and use the CLI's established `error: ...` stderr contract.
 
 ## Cross-repository contract
+
+Capability discovery is validated against the published provider contract from
+[provider PR #68](https://github.com/alemar11/test-01/pull/68), exact candidate
+`a42ae787504f161f7dd69b4d0c48afe9a4b14e4a`. The provider checkout is contract
+evidence only and never Git ancestry for this repository.
+
+To reproduce the live read-only check, prepare an isolated `test-01` checkout
+with its dependencies, then pin and verify it before starting the API:
+
+```bash
+provider_worktree=/absolute/path/to/test-01-provider-candidate
+test "$(git -C "$provider_worktree" rev-parse HEAD)" = \
+  a42ae787504f161f7dd69b4d0c48afe9a4b14e4a
+test -z "$(git -C "$provider_worktree" status --porcelain)"
+npm --prefix "$provider_worktree" start
+```
+
+From this consumer repository in another shell, run:
+
+```bash
+uv run test-02 --base-url http://127.0.0.1:3000 capabilities
+```
+
+The command must exit `0` with deterministic sorted-key schema version 1 JSON.
+After stopping the server, repeat the provider SHA and cleanliness checks to
+confirm that verification did not change provider state.
 
 The discovery shape remains tested against the label-aware `test-01` contract from
 [provider PR #60](https://github.com/alemar11/test-01/pull/60), verified at
