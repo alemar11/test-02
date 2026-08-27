@@ -237,6 +237,54 @@ class ApiClientTests(unittest.TestCase):
             [("http://api.example.test/api/capabilities", 5.0, None)],
         )
 
+    def test_capabilities_accepts_additive_reordered_supported_values(self) -> None:
+        manifest = capability_manifest()
+        controls = capability_entry(manifest, "item-collection")["controls"]
+        controls["sort"]["values"] = ["future-sort", "status", "id", "name"]
+        controls["order"]["values"] = ["desc", "future-order", "asc"]
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        self.assertIs(client.capabilities(), manifest)
+
+    def test_capabilities_rejects_supported_values_missing_required_choices(
+        self,
+    ) -> None:
+        for control_name, values in (
+            ("sort", ["name", "status", "future-sort"]),
+            ("order", ["asc", "future-order"]),
+        ):
+            with self.subTest(control=control_name):
+                manifest = capability_manifest()
+                capability_entry(manifest, "item-collection")["controls"][
+                    control_name
+                ]["values"] = values
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "missing required values"):
+                    client.capabilities()
+
+    def test_capabilities_accepts_provider_ranges_wider_than_consumer_ranges(
+        self,
+    ) -> None:
+        manifest = capability_manifest()
+        controls = capability_entry(manifest, "item-collection")["controls"]
+        controls["page"]["minimum"] = 0
+        controls["page"]["maximum"] = MAX_PAGE + 1
+        controls["limit"]["minimum"] = 0
+        controls["limit"]["maximum"] = 200
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        self.assertIs(client.capabilities(), manifest)
+
     def test_capabilities_rejects_unsupported_schema_versions(self) -> None:
         for schema_version in (None, True, "1", 2):
             with self.subTest(schema_version=schema_version):
@@ -349,6 +397,12 @@ class ApiClientTests(unittest.TestCase):
             "maximum"
         ] = 99
         cases.append(("result limit", wrong_result_limit))
+
+        wrong_page_minimum = capability_manifest()
+        capability_entry(wrong_page_minimum, "item-collection")["controls"]["page"][
+            "minimum"
+        ] = 2
+        cases.append(("page minimum", wrong_page_minimum))
 
         for name, manifest in cases:
             with self.subTest(name=name):

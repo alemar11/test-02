@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -416,7 +417,30 @@ def _validate_required_capability_subset(
         return
 
     if isinstance(required, list):
-        if not isinstance(actual, list) or len(actual) != len(required):
+        if not isinstance(actual, list):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                f"expected {required!r}"
+            )
+
+        if location.endswith(".values"):
+            missing_values = [
+                required_value
+                for required_value in required
+                if not any(
+                    type(actual_value) is type(required_value)
+                    and actual_value == required_value
+                    for actual_value in actual
+                )
+            ]
+            if missing_values:
+                raise ApiError(
+                    f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                    f"missing required values {missing_values!r}"
+                )
+            return
+
+        if len(actual) != len(required):
             raise ApiError(
                 f"{_CAPABILITY_PATH} returned incompatible {location}; "
                 f"expected {required!r}"
@@ -426,6 +450,30 @@ def _validate_required_capability_subset(
                 actual_value,
                 required_value,
                 location=f"{location}[{index}]",
+            )
+        return
+
+    if location.endswith(".minimum"):
+        if (
+            type(actual) not in (int, float)
+            or (type(actual) is float and not math.isfinite(actual))
+            or actual > required
+        ):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                f"expected a value no greater than {required!r}"
+            )
+        return
+
+    if location.endswith(".maximum"):
+        if (
+            type(actual) not in (int, float)
+            or (type(actual) is float and not math.isfinite(actual))
+            or actual < required
+        ):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                f"expected a value no less than {required!r}"
             )
         return
 
