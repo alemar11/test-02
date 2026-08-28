@@ -10,6 +10,34 @@ from test_02.client import ApiError
 
 class CliTests(unittest.TestCase):
     @patch("test_02.cli.ApiClient")
+    def test_capabilities_prints_deterministic_sorted_key_json(self, client_class) -> None:
+        manifest = {
+            "schemaVersion": 1,
+            "capabilities": [
+                {"path": "/health", "method": "GET", "id": "health"},
+            ],
+        }
+        client_class.return_value.capabilities.return_value = manifest
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "--base-url",
+                    "http://api.example.test",
+                    "capabilities",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with("http://api.example.test")
+        client_class.return_value.capabilities.assert_called_once_with()
+        self.assertEqual(
+            output.getvalue(),
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
     def test_items_prints_the_deterministic_discovery_envelope(self, client_class) -> None:
         envelope = {
             "data": [{"labels": ["featured"], "id": "item-1"}],
@@ -185,6 +213,28 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(errors.getvalue(), "error: transport failed\n")
+
+    @patch("test_02.cli.ApiClient")
+    def test_capability_errors_use_the_existing_cli_error_contract(
+        self,
+        client_class,
+    ) -> None:
+        client_class.return_value.capabilities.side_effect = ApiError(
+            "GET /api/capabilities returned unsupported schema version 2; expected 1"
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["capabilities"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: GET /api/capabilities returned unsupported schema version 2; "
+            "expected 1\n",
+        )
 
     @patch("test_02.cli.ApiClient")
     def test_facet_errors_use_the_existing_cli_error_contract(self, client_class) -> None:

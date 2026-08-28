@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,85 @@ _FACET_DATA_KEYS = {"total", "byLabel"}
 _FACET_FILTER_KEYS = {"status", "category", "label", "q"}
 _SORT_FIELDS = {"id", "name", "status"}
 _SORT_ORDERS = {"asc", "desc"}
+_CAPABILITY_PATH = "GET /api/capabilities"
+_SUPPORTED_CAPABILITY_SCHEMA_VERSION = 1
+_ITEM_FILTER_CAPABILITY_CONTROLS: JsonObject = {
+    "status": {
+        "type": "string",
+        "cardinality": "single",
+        "nonBlank": True,
+        "match": "exact",
+    },
+    "category": {
+        "type": "string",
+        "cardinality": "single",
+        "nonBlank": True,
+        "match": "exact",
+    },
+    "label": {
+        "type": "string",
+        "cardinality": "single",
+        "nonBlank": True,
+        "match": "exact-membership",
+    },
+    "q": {
+        "type": "string",
+        "cardinality": "single",
+        "nonBlank": True,
+        "match": "case-insensitive-substring",
+        "normalize": ["trim", "lowercase"],
+    },
+}
+_REQUIRED_CAPABILITIES: dict[str, JsonObject] = {
+    "health": {
+        "method": "GET",
+        "path": "/health",
+    },
+    "item-collection": {
+        "method": "GET",
+        "path": "/api/items",
+        "controls": {
+            **_ITEM_FILTER_CAPABILITY_CONTROLS,
+            "sort": {
+                "type": "string",
+                "cardinality": "single",
+                "values": ["id", "name", "status"],
+            },
+            "order": {
+                "type": "string",
+                "cardinality": "single",
+                "values": ["asc", "desc"],
+                "default": "asc",
+                "requires": "sort",
+            },
+            "page": {
+                "type": "integer",
+                "cardinality": "single",
+                "minimum": 1,
+                "maximum": MAX_PAGE,
+                "default": 1,
+                "defaultWhen": "any-control",
+            },
+            "limit": {
+                "type": "integer",
+                "cardinality": "single",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20,
+                "defaultWhen": "any-control",
+            },
+        },
+    },
+    "item-facets": {
+        "method": "GET",
+        "path": "/api/items/facets",
+        "controls": _ITEM_FILTER_CAPABILITY_CONTROLS,
+    },
+    "capability-discovery": {
+        "method": "GET",
+        "path": "/api/capabilities",
+    },
+}
 _ECMASCRIPT_TRIM_CHARACTERS = (
     "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680"
     "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
@@ -162,6 +242,12 @@ class ApiClient:
     def health(self) -> JsonObject:
         return self._get("/health")
 
+    def capabilities(self) -> JsonObject:
+        """Return the provider manifest after validating required compatibility."""
+        payload = self._get("/api/capabilities")
+        _validate_capability_manifest(payload)
+        return payload
+
     def list_items(self) -> list[JsonObject]:
         payload = self._get("/api/items")
         data = payload.get("data")
@@ -246,6 +332,156 @@ class ApiClient:
         if not isinstance(payload, dict):
             raise ApiError(f"GET {path} returned a non-object JSON payload")
         return payload
+
+
+def _validate_capability_manifest(payload: JsonObject) -> None:
+    schema_version = payload.get("schemaVersion")
+    if (
+        type(schema_version) is not int
+        or schema_version != _SUPPORTED_CAPABILITY_SCHEMA_VERSION
+    ):
+        raise ApiError(
+            f"{_CAPABILITY_PATH} returned unsupported schema version "
+            f"{schema_version!r}; expected {_SUPPORTED_CAPABILITY_SCHEMA_VERSION}"
+        )
+
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, list):
+        raise ApiError(
+            f"{_CAPABILITY_PATH} returned malformed field 'capabilities'; "
+            "expected a list"
+        )
+
+    capabilities_by_id: dict[str, JsonObject] = {}
+    for index, capability in enumerate(capabilities):
+        if not isinstance(capability, dict):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned malformed capability entry at "
+                f"index {index}; expected an object"
+            )
+
+        capability_id = capability.get("id")
+        if (
+            type(capability_id) is not str
+            or not capability_id
+            or capability_id.strip() != capability_id
+        ):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned malformed capability entry at "
+                f"index {index}; field 'id' must be a non-blank trimmed string"
+            )
+        if capability_id in capabilities_by_id:
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned duplicate capability id "
+                f"{capability_id!r}"
+            )
+        capabilities_by_id[capability_id] = capability
+
+    for capability_id, required_fields in _REQUIRED_CAPABILITIES.items():
+        capability = capabilities_by_id.get(capability_id)
+        if capability is None:
+            raise ApiError(
+                f"{_CAPABILITY_PATH} is missing required capability "
+                f"{capability_id!r}"
+            )
+        _validate_required_capability_subset(
+            capability,
+            required_fields,
+            location=f"capability {capability_id!r}",
+        )
+
+
+def _validate_required_capability_subset(
+    actual: Any,
+    required: Any,
+    *,
+    location: str,
+) -> None:
+    if isinstance(required, dict):
+        if not isinstance(actual, dict):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                "expected an object"
+            )
+        for name, required_value in required.items():
+            if name not in actual:
+                raise ApiError(
+                    f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                    f"missing required field {name!r}"
+                )
+            _validate_required_capability_subset(
+                actual[name],
+                required_value,
+                location=f"{location}.{name}",
+            )
+        return
+
+    if isinstance(required, list):
+        if not isinstance(actual, list):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                f"expected {required!r}"
+            )
+
+        if location.endswith(".values"):
+            missing_values = [
+                required_value
+                for required_value in required
+                if not any(
+                    type(actual_value) is type(required_value)
+                    and actual_value == required_value
+                    for actual_value in actual
+                )
+            ]
+            if missing_values:
+                raise ApiError(
+                    f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                    f"missing required values {missing_values!r}"
+                )
+            return
+
+        if len(actual) != len(required):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                f"expected {required!r}"
+            )
+        for index, (actual_value, required_value) in enumerate(zip(actual, required)):
+            _validate_required_capability_subset(
+                actual_value,
+                required_value,
+                location=f"{location}[{index}]",
+            )
+        return
+
+    if location.endswith(".minimum"):
+        if (
+            type(actual) not in (int, float)
+            or (type(actual) is float and not math.isfinite(actual))
+            or actual > required
+        ):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                f"expected a value no greater than {required!r}"
+            )
+        return
+
+    if location.endswith(".maximum"):
+        if (
+            type(actual) not in (int, float)
+            or (type(actual) is float and not math.isfinite(actual))
+            or actual < required
+        ):
+            raise ApiError(
+                f"{_CAPABILITY_PATH} returned incompatible {location}; "
+                f"expected a value no less than {required!r}"
+            )
+        return
+
+    if type(actual) is not type(required) or actual != required:
+        raise ApiError(
+            f"{_CAPABILITY_PATH} returned incompatible {location}; "
+            f"expected {required!r}"
+        )
 
 
 def _discovery_query(

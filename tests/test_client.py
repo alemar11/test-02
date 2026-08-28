@@ -54,6 +54,97 @@ def facet_envelope(
     }
 
 
+def capability_manifest() -> dict[str, Any]:
+    item_filter_controls = {
+        "status": {
+            "type": "string",
+            "cardinality": "single",
+            "nonBlank": True,
+            "match": "exact",
+        },
+        "category": {
+            "type": "string",
+            "cardinality": "single",
+            "nonBlank": True,
+            "match": "exact",
+        },
+        "label": {
+            "type": "string",
+            "cardinality": "single",
+            "nonBlank": True,
+            "match": "exact-membership",
+        },
+        "q": {
+            "type": "string",
+            "cardinality": "single",
+            "nonBlank": True,
+            "match": "case-insensitive-substring",
+            "normalize": ["trim", "lowercase"],
+        },
+    }
+    return {
+        "schemaVersion": 1,
+        "capabilities": [
+            {"id": "health", "method": "GET", "path": "/health"},
+            {
+                "id": "item-collection",
+                "method": "GET",
+                "path": "/api/items",
+                "controls": {
+                    **copy.deepcopy(item_filter_controls),
+                    "sort": {
+                        "type": "string",
+                        "cardinality": "single",
+                        "values": ["id", "name", "status"],
+                    },
+                    "order": {
+                        "type": "string",
+                        "cardinality": "single",
+                        "values": ["asc", "desc"],
+                        "default": "asc",
+                        "requires": "sort",
+                    },
+                    "page": {
+                        "type": "integer",
+                        "cardinality": "single",
+                        "minimum": 1,
+                        "maximum": MAX_PAGE,
+                        "default": 1,
+                        "defaultWhen": "any-control",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "cardinality": "single",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20,
+                        "defaultWhen": "any-control",
+                    },
+                },
+            },
+            {
+                "id": "item-facets",
+                "method": "GET",
+                "path": "/api/items/facets",
+                "controls": copy.deepcopy(item_filter_controls),
+            },
+            {
+                "id": "capability-discovery",
+                "method": "GET",
+                "path": "/api/capabilities",
+            },
+        ],
+    }
+
+
+def capability_entry(manifest: dict[str, Any], capability_id: str) -> dict[str, Any]:
+    return next(
+        capability
+        for capability in manifest["capabilities"]
+        if capability["id"] == capability_id
+    )
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -121,6 +212,253 @@ class ApiClientTests(unittest.TestCase):
 
         self.assertEqual(client.health(), {"status": "ok"})
         self.assertEqual(session.calls, [("http://api.example.test/health", 5.0, None)])
+
+    def test_capabilities_validates_required_semantics_and_preserves_additions(
+        self,
+    ) -> None:
+        manifest = capability_manifest()
+        manifest["provider"] = {"name": "test-01"}
+        collection = capability_entry(manifest, "item-collection")
+        collection["documentation"] = {"stability": "stable"}
+        collection["controls"]["limit"]["unit"] = "items"
+        collection["controls"]["cursor"] = {"type": "string"}
+        manifest["capabilities"].append(
+            {
+                "id": "future-read-surface",
+                "futureField": {"nested": True},
+            }
+        )
+        session = FakeSession(FakeResponse(manifest))
+        client = ApiClient("http://api.example.test/", session=session)  # type: ignore[arg-type]
+
+        self.assertIs(client.capabilities(), manifest)
+        self.assertEqual(
+            session.calls,
+            [("http://api.example.test/api/capabilities", 5.0, None)],
+        )
+
+    def test_capabilities_accepts_additive_reordered_supported_values(self) -> None:
+        manifest = capability_manifest()
+        controls = capability_entry(manifest, "item-collection")["controls"]
+        controls["sort"]["values"] = ["future-sort", "status", "id", "name"]
+        controls["order"]["values"] = ["desc", "future-order", "asc"]
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        self.assertIs(client.capabilities(), manifest)
+
+    def test_capabilities_rejects_supported_values_missing_required_choices(
+        self,
+    ) -> None:
+        for control_name, values in (
+            ("sort", ["name", "status", "future-sort"]),
+            ("order", ["asc", "future-order"]),
+        ):
+            with self.subTest(control=control_name):
+                manifest = capability_manifest()
+                capability_entry(manifest, "item-collection")["controls"][
+                    control_name
+                ]["values"] = values
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "missing required values"):
+                    client.capabilities()
+
+    def test_capabilities_accepts_provider_ranges_wider_than_consumer_ranges(
+        self,
+    ) -> None:
+        manifest = capability_manifest()
+        controls = capability_entry(manifest, "item-collection")["controls"]
+        controls["page"]["minimum"] = 0
+        controls["page"]["maximum"] = MAX_PAGE + 1
+        controls["limit"]["minimum"] = 0
+        controls["limit"]["maximum"] = 200
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        self.assertIs(client.capabilities(), manifest)
+
+    def test_capabilities_rejects_unsupported_schema_versions(self) -> None:
+        for schema_version in (None, True, "1", 2):
+            with self.subTest(schema_version=schema_version):
+                manifest = capability_manifest()
+                if schema_version is None:
+                    del manifest["schemaVersion"]
+                else:
+                    manifest["schemaVersion"] = schema_version
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "unsupported schema version"):
+                    client.capabilities()
+
+    def test_capabilities_rejects_malformed_entries_and_duplicate_ids(self) -> None:
+        for capabilities in (None, {}, "health"):
+            with self.subTest(capabilities=capabilities):
+                manifest = capability_manifest()
+                manifest["capabilities"] = capabilities
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "malformed field 'capabilities'"):
+                    client.capabilities()
+
+        malformed_cases: list[Any] = [None, "health", {}, {"id": ""}, {"id": " health "}]
+        for malformed_entry in malformed_cases:
+            with self.subTest(malformed_entry=malformed_entry):
+                manifest = capability_manifest()
+                manifest["capabilities"].append(malformed_entry)
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "malformed capability entry"):
+                    client.capabilities()
+
+        manifest = capability_manifest()
+        manifest["capabilities"].append({"id": "health"})
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(ApiError, "duplicate capability id 'health'"):
+            client.capabilities()
+
+    def test_capabilities_rejects_missing_required_capabilities(self) -> None:
+        required_ids = (
+            "health",
+            "item-collection",
+            "item-facets",
+            "capability-discovery",
+        )
+        for missing_id in required_ids:
+            with self.subTest(missing_id=missing_id):
+                manifest = capability_manifest()
+                manifest["capabilities"] = [
+                    capability
+                    for capability in manifest["capabilities"]
+                    if capability["id"] != missing_id
+                ]
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(
+                    ApiError,
+                    f"missing required capability '{missing_id}'",
+                ):
+                    client.capabilities()
+
+    def test_capabilities_rejects_incompatible_required_semantics(self) -> None:
+        cases: list[tuple[str, dict[str, Any]]] = []
+
+        wrong_method = capability_manifest()
+        capability_entry(wrong_method, "health")["method"] = "POST"
+        cases.append(("method", wrong_method))
+
+        wrong_path = capability_manifest()
+        capability_entry(wrong_path, "item-facets")["path"] = "/api/facets"
+        cases.append(("path", wrong_path))
+
+        wrong_control = capability_manifest()
+        capability_entry(wrong_control, "item-collection")["controls"]["label"][
+            "match"
+        ] = "exact"
+        cases.append(("control", wrong_control))
+
+        wrong_default = capability_manifest()
+        capability_entry(wrong_default, "item-collection")["controls"]["order"][
+            "default"
+        ] = "desc"
+        cases.append(("default", wrong_default))
+
+        wrong_page_limit = capability_manifest()
+        capability_entry(wrong_page_limit, "item-collection")["controls"]["page"][
+            "maximum"
+        ] = MAX_PAGE - 1
+        cases.append(("page maximum", wrong_page_limit))
+
+        wrong_result_limit = capability_manifest()
+        capability_entry(wrong_result_limit, "item-collection")["controls"]["limit"][
+            "maximum"
+        ] = 99
+        cases.append(("result limit", wrong_result_limit))
+
+        wrong_page_minimum = capability_manifest()
+        capability_entry(wrong_page_minimum, "item-collection")["controls"]["page"][
+            "minimum"
+        ] = 2
+        cases.append(("page minimum", wrong_page_minimum))
+
+        for name, manifest in cases:
+            with self.subTest(name=name):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "returned incompatible capability"):
+                    client.capabilities()
+
+    def test_capabilities_never_uses_cached_or_stale_manifest_data(self) -> None:
+        manifest = capability_manifest()
+        session = FakeSession(FakeResponse(manifest))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertIs(client.capabilities(), manifest)
+        session.error = requests.ConnectionError("offline")
+
+        with self.assertRaisesRegex(
+            ApiError,
+            "GET /api/capabilities transport failed",
+        ):
+            client.capabilities()
+
+        self.assertEqual(len(session.calls), 2)
+
+    def test_capabilities_preserves_transport_http_json_and_shape_errors(self) -> None:
+        cases = (
+            (
+                FakeSession(error=requests.ConnectionError("offline")),
+                "GET /api/capabilities transport failed",
+            ),
+            (
+                FakeSession(FakeResponse({}, status_code=503)),
+                "GET /api/capabilities returned HTTP 503",
+            ),
+            (
+                FakeSession(FakeResponse({}, json_error=ValueError("bad json"))),
+                "GET /api/capabilities returned invalid JSON",
+            ),
+            (
+                FakeSession(FakeResponse([])),
+                "GET /api/capabilities returned a non-object JSON payload",
+            ),
+        )
+
+        for session, message in cases:
+            with self.subTest(message=message):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, message):
+                    client.capabilities()
 
     def test_list_items_preserves_the_data_only_contract(self) -> None:
         session = FakeSession(FakeResponse({"data": [{"id": "item-1"}]}))

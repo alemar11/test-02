@@ -39,6 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("health", help="Read API health")
+    commands.add_parser(
+        "capabilities",
+        help="Discover compatible provider capabilities",
+    )
     items = commands.add_parser("items", help="Discover items")
     items.add_argument("--status", help="Exact status filter")
     items.add_argument("--category", help="Exact category filter")
@@ -67,6 +71,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "health":
             payload = client.health()
+        elif args.command == "capabilities":
+            payload = client.capabilities()
         elif args.command == "items":
             payload = client.discover_items(
                 status=args.status,
