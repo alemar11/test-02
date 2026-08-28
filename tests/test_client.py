@@ -54,6 +54,48 @@ def facet_envelope(
     }
 
 
+def summary_envelope(
+    *,
+    total: int = 2,
+    by_status: dict[str, int] | None = None,
+    by_category: dict[str, int] | None = None,
+    global_total: int = 2,
+    matching: int | None = None,
+    insight_by_status: dict[str, int] | None = None,
+    filters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    status_counts = by_status if by_status is not None else {"active": 2}
+    category_counts = (
+        by_category
+        if by_category is not None
+        else {"core-service": 1, "support-service": 1}
+    )
+    return {
+        "data": {
+            "total": total,
+            "byStatus": status_counts,
+            "byCategory": category_counts,
+        },
+        "insights": {
+            "total": global_total,
+            "matching": total if matching is None else matching,
+            "byStatus": (
+                copy.deepcopy(status_counts)
+                if insight_by_status is None
+                else insight_by_status
+            ),
+            "filters": filters
+            if filters is not None
+            else {
+                "status": None,
+                "category": None,
+                "label": None,
+                "q": None,
+            },
+        },
+    }
+
+
 def capability_manifest() -> dict[str, Any]:
     item_filter_controls = {
         "status": {
@@ -126,6 +168,12 @@ def capability_manifest() -> dict[str, Any]:
                 "id": "item-facets",
                 "method": "GET",
                 "path": "/api/items/facets",
+                "controls": copy.deepcopy(item_filter_controls),
+            },
+            {
+                "id": "item-summary",
+                "method": "GET",
+                "path": "/api/items/summary",
                 "controls": copy.deepcopy(item_filter_controls),
             },
             {
@@ -222,6 +270,9 @@ class ApiClientTests(unittest.TestCase):
         collection["documentation"] = {"stability": "stable"}
         collection["controls"]["limit"]["unit"] = "items"
         collection["controls"]["cursor"] = {"type": "string"}
+        summary = capability_entry(manifest, "item-summary")
+        summary["documentation"] = {"stability": "stable"}
+        summary["controls"]["future-filter"] = {"type": "string"}
         manifest["capabilities"].append(
             {
                 "id": "future-read-surface",
@@ -342,6 +393,7 @@ class ApiClientTests(unittest.TestCase):
             "health",
             "item-collection",
             "item-facets",
+            "item-summary",
             "capability-discovery",
         )
         for missing_id in required_ids:
@@ -371,11 +423,11 @@ class ApiClientTests(unittest.TestCase):
         cases.append(("method", wrong_method))
 
         wrong_path = capability_manifest()
-        capability_entry(wrong_path, "item-facets")["path"] = "/api/facets"
+        capability_entry(wrong_path, "item-summary")["path"] = "/api/summary"
         cases.append(("path", wrong_path))
 
         wrong_control = capability_manifest()
-        capability_entry(wrong_control, "item-collection")["controls"]["label"][
+        capability_entry(wrong_control, "item-summary")["controls"]["label"][
             "match"
         ] = "exact"
         cases.append(("control", wrong_control))
@@ -603,6 +655,82 @@ class ApiClientTests(unittest.TestCase):
                     [("http://api.example.test/api/items/facets", 5.0, {})],
                 )
 
+    def test_item_summary_transports_supported_filters_and_validates_insights(
+        self,
+    ) -> None:
+        response = summary_envelope(
+            total=1,
+            by_status={"active": 1},
+            by_category={"core-service": 1},
+            global_total=2,
+            filters={
+                "status": "active",
+                "category": "core-service",
+                "label": "featured",
+                "q": "first",
+            },
+        )
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient(
+            "http://api.example.test",
+            session=session,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(
+            client.item_summary(
+                status="active",
+                category="core-service",
+                label="featured",
+                q="\ufeff FIRST \ufeff",
+            ),
+            response,
+        )
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "http://api.example.test/api/items/summary",
+                    5.0,
+                    {
+                        "status": "active",
+                        "category": "core-service",
+                        "label": "featured",
+                        "q": "\ufeff FIRST \ufeff",
+                    },
+                )
+            ],
+        )
+
+    def test_item_summary_accepts_full_empty_and_additive_envelopes(self) -> None:
+        full = summary_envelope()
+        full["provider"] = {"version": 1}
+        full["data"]["futureAggregate"] = {"active": 2}
+        full["insights"]["futureInsight"] = True
+        full["insights"]["filters"]["futureFilter"] = None
+
+        empty = summary_envelope(
+            total=0,
+            by_status={},
+            by_category={},
+            global_total=2,
+            filters={
+                "status": None,
+                "category": None,
+                "label": None,
+                "q": "missing",
+            },
+        )
+
+        for response, options in ((full, {}), (empty, {"q": "missing"})):
+            with self.subTest(response=response):
+                session = FakeSession(FakeResponse(response))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                self.assertEqual(client.item_summary(**options), response)
+
     def test_discover_items_normalizes_string_subclasses_to_json_strings(self) -> None:
         response = collection_envelope(
             data=[],
@@ -817,6 +945,43 @@ class ApiClientTests(unittest.TestCase):
 
                 self.assertEqual(session.calls, [])
 
+    def test_invalid_and_unsupported_summary_options_fail_before_a_request(
+        self,
+    ) -> None:
+        invalid_options = (
+            {"status": ""},
+            {"category": "  "},
+            {"label": "\ufeff"},
+            {"q": "\ud800"},
+            {"status": 1},
+        )
+
+        for options in invalid_options:
+            with self.subTest(options=options):
+                session = FakeSession(FakeResponse(summary_envelope()))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "invalid summary option"):
+                    client.item_summary(**options)  # type: ignore[arg-type]
+
+                self.assertEqual(session.calls, [])
+
+        for options in ({"sort": "name"}, {"page": 1}, {"limit": 20}):
+            with self.subTest(options=options):
+                session = FakeSession(FakeResponse(summary_envelope()))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaises(TypeError):
+                    client.item_summary(**options)  # type: ignore[arg-type]
+
+                self.assertEqual(session.calls, [])
+
         for options in ({"sort": "name"}, {"page": 1}, {"limit": 20}):
             with self.subTest(options=options):
                 session = FakeSession(FakeResponse(facet_envelope()))
@@ -976,6 +1141,112 @@ class ApiClientTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ApiError, message):
                     client.item_facets()
+
+    def test_item_summary_rejects_incomplete_or_inconsistent_envelopes(self) -> None:
+        invalid_envelopes = []
+
+        missing_insights = summary_envelope()
+        del missing_insights["insights"]
+        invalid_envelopes.append(missing_insights)
+
+        incomplete_data = summary_envelope()
+        del incomplete_data["data"]["byCategory"]
+        invalid_envelopes.append(incomplete_data)
+
+        boolean_total = summary_envelope()
+        boolean_total["data"]["total"] = True
+        invalid_envelopes.append(boolean_total)
+
+        negative_count = summary_envelope()
+        negative_count["data"]["byStatus"]["active"] = -1
+        invalid_envelopes.append(negative_count)
+
+        inconsistent_status_total = summary_envelope()
+        inconsistent_status_total["data"]["byStatus"]["active"] = 1
+        invalid_envelopes.append(inconsistent_status_total)
+
+        inconsistent_category_total = summary_envelope()
+        inconsistent_category_total["data"]["byCategory"] = {"core-service": 1}
+        invalid_envelopes.append(inconsistent_category_total)
+
+        inconsistent_matching = summary_envelope(matching=1)
+        invalid_envelopes.append(inconsistent_matching)
+
+        global_below_matching = summary_envelope(global_total=1)
+        invalid_envelopes.append(global_below_matching)
+
+        inconsistent_insight_status = summary_envelope(
+            insight_by_status={"inactive": 2}
+        )
+        invalid_envelopes.append(inconsistent_insight_status)
+
+        incomplete_filters = summary_envelope()
+        del incomplete_filters["insights"]["filters"]["label"]
+        invalid_envelopes.append(incomplete_filters)
+
+        for envelope in invalid_envelopes:
+            with self.subTest(envelope=envelope):
+                session = FakeSession(FakeResponse(copy.deepcopy(envelope)))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(
+                    ApiError,
+                    "GET /api/items/summary returned",
+                ):
+                    client.item_summary()
+
+        drifted_filters = summary_envelope(
+            total=1,
+            by_status={"active": 1},
+            by_category={"core-service": 1},
+            filters={
+                "status": "unexpected",
+                "category": None,
+                "label": None,
+                "q": None,
+            },
+        )
+        session = FakeSession(FakeResponse(drifted_filters))
+        client = ApiClient(
+            "http://api.example.test",
+            session=session,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(ApiError, "does not match the request"):
+            client.item_summary(status="active")
+
+    def test_item_summary_preserves_transport_http_json_and_shape_errors(self) -> None:
+        cases = (
+            (
+                FakeSession(error=requests.ConnectionError("offline")),
+                "GET /api/items/summary transport failed",
+            ),
+            (
+                FakeSession(FakeResponse({}, status_code=422)),
+                "GET /api/items/summary returned HTTP 422",
+            ),
+            (
+                FakeSession(FakeResponse({}, json_error=ValueError("bad json"))),
+                "GET /api/items/summary returned invalid JSON",
+            ),
+            (
+                FakeSession(FakeResponse([])),
+                "GET /api/items/summary returned a non-object JSON payload",
+            ),
+        )
+
+        for session, message in cases:
+            with self.subTest(message=message):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, message):
+                    client.item_summary()
 
     def test_transport_http_json_and_top_level_shape_errors_are_distinct(self) -> None:
         cases = (

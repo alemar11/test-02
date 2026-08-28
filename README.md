@@ -67,6 +67,7 @@ manifest = client.capabilities()
 envelope = client.discover_items(label="featured", sort="name", limit=5)
 items = client.list_items()
 facets = client.item_facets(label="read-only", status="active")
+summary = client.item_summary(label="support", status="active", q=" second ")
 ```
 
 `discover_items()` validates options locally before sending a request. Blank
@@ -83,9 +84,9 @@ The fixed `capabilities` command and `ApiClient.capabilities()` read
 `GET /api/capabilities` on every invocation. They accept provider schema
 version `1` only and validate the unique capability identities plus the
 required consumer contract for health, item collection, item facets, and
-capability discovery. Required methods, paths, filter behavior, sorting,
-normalization, defaults, pagination range, and result limit must remain
-compatible.
+item summaries, and capability discovery. Required methods, paths, filter
+behavior, sorting, normalization, defaults, pagination range, and result limit
+must remain compatible.
 
 Compatibility is subset-based: new capability IDs and fields are preserved in
 the returned manifest and printed output. Missing or duplicate identities,
@@ -111,6 +112,66 @@ unsupported Python runtime, or unavailable package metadata are reported in
 the JSON and produce exit status `1`. This command is independent from the
 live `test-02 health` and `test-02 items` commands and never makes a network
 request.
+
+## Item summaries
+
+`ApiClient.item_summary()` requests provider-owned aggregates over the complete
+matching item set. It supports only `status`, `category`, `label`, and `q`;
+sorting and pagination are intentionally excluded. Status, category, and label
+retain exact matching semantics. The client sends the original non-blank `q`
+value and verifies the provider's trimmed, case-normalized filter echo.
+
+For example:
+
+```python
+from test_02.client import ApiClient
+
+client = ApiClient("http://127.0.0.1:3000")
+summary = client.item_summary(
+    status="active",
+    label="support",
+    q=" SECOND ",
+)
+```
+
+returns the validated provider envelope:
+
+```json
+{
+  "data": {
+    "byCategory": {
+      "support-service": 1
+    },
+    "byStatus": {
+      "active": 1
+    },
+    "total": 1
+  },
+  "insights": {
+    "byStatus": {
+      "active": 1
+    },
+    "filters": {
+      "category": null,
+      "label": "support",
+      "q": "second",
+      "status": "active"
+    },
+    "matching": 1,
+    "total": 2
+  }
+}
+```
+
+The client validates every required summary and insight field, non-negative
+integer counts, status and category grouping totals, matching versus global
+totals, matching status insights, and the echoed filters. Required fields are
+subset-checked so additive provider metadata remains compatible. Empty filtered
+sets are valid when matching totals are zero and grouping maps are empty. Blank
+or non-string filters fail before a request; transport, HTTP, invalid-JSON,
+top-level-shape, and summary-shape errors remain distinct `ApiError` failures.
+The client consumes these aggregates directly and never recounts downloaded
+items.
 
 ## Facet insights
 
@@ -181,6 +242,14 @@ uv run test-02 --base-url http://127.0.0.1:3000 capabilities
 The command must exit `0` with deterministic sorted-key schema version 1 JSON.
 After stopping the server, repeat the provider SHA and cleanliness checks to
 confirm that verification did not change provider state.
+
+The item-summary client contract is also checked against `test-01` `main` at
+[provider commit
+`19179395350920916f348485dab8d70bd000780c`](https://github.com/alemar11/test-01/commit/19179395350920916f348485dab8d70bd000780c).
+That provider advertises schema-version-1 `item-summary` compatibility and
+serves the complete `data` plus `insights` envelope documented above. The
+network-free client tests exercise full, filtered, empty, additive, malformed,
+and cross-field-inconsistent responses without changing provider state.
 
 The discovery shape remains tested against the label-aware `test-01` contract from
 [provider PR #60](https://github.com/alemar11/test-01/pull/60), verified at
