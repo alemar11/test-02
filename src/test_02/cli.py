@@ -57,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     facets.add_argument("--category", help="Exact category filter")
     facets.add_argument("--label", help="Exact label membership filter")
     facets.add_argument("--q", help="Case-insensitive item name search")
+    summary = commands.add_parser("summary", help="Read the item summary")
+    summary.add_argument("--status", help="Exact status filter")
+    summary.add_argument("--category", help="Exact category filter")
+    summary.add_argument("--label", help="Exact label membership filter")
+    summary.add_argument("--q", help="Case-insensitive item name search")
     return parser
 
 
@@ -84,8 +89,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 page=args.page,
                 limit=args.limit,
             )
-        else:
+        elif args.command == "facets":
             payload = client.item_facets(
+                status=args.status,
+                category=args.category,
+                label=args.label,
+                q=args.q,
+            )
+        else:
+            payload = client.item_summary(
                 status=args.status,
                 category=args.category,
                 label=args.label,

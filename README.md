@@ -16,6 +16,8 @@ uv run test-02 capabilities
 uv run test-02 items
 uv run test-02 items --label featured --status active --sort name --limit 5
 uv run test-02 facets --label read-only --status active
+uv run test-02 summary
+uv run test-02 summary --status active --label support --q " SECOND "
 ```
 
 Use `--base-url` before the command to point the client at another local API
@@ -115,13 +117,21 @@ request.
 
 ## Item summaries
 
-`ApiClient.item_summary()` requests provider-owned aggregates over the complete
-matching item set. It supports only `status`, `category`, `label`, and `q`;
-sorting and pagination are intentionally excluded. Status, category, and label
-retain exact matching semantics. The client sends the original non-blank `q`
-value and verifies the provider's trimmed, case-normalized filter echo.
+The `summary` command and `ApiClient.item_summary()` request provider-owned
+aggregates over the complete matching item set. They support only `status`,
+`category`, `label`, and `q`; sorting, ordering, and pagination are intentionally
+excluded. Status, category, and label retain exact matching semantics. The
+client sends the original non-blank `q` value and verifies the provider's
+trimmed, case-normalized filter echo.
 
-For example:
+Run the command without filters or with any supported filter combination:
+
+```bash
+uv run test-02 summary
+uv run test-02 summary --status active --category support-service --label support --q " SECOND "
+```
+
+Python callers use the same validated operation:
 
 ```python
 from test_02.client import ApiClient
