@@ -23,6 +23,9 @@ _QUERY_KEYS = {
 _FACET_ENVELOPE_KEYS = {"data", "filters"}
 _FACET_DATA_KEYS = {"total", "byLabel"}
 _FACET_FILTER_KEYS = {"status", "category", "label", "q"}
+_SUMMARY_ENVELOPE_KEYS = {"data", "insights"}
+_SUMMARY_DATA_KEYS = {"total", "byStatus", "byCategory"}
+_SUMMARY_INSIGHT_KEYS = {"total", "matching", "byStatus", "filters"}
 _SORT_FIELDS = {"id", "name", "status"}
 _SORT_ORDERS = {"asc", "desc"}
 _CAPABILITY_PATH = "GET /api/capabilities"
@@ -97,6 +100,11 @@ _REQUIRED_CAPABILITIES: dict[str, JsonObject] = {
     "item-facets": {
         "method": "GET",
         "path": "/api/items/facets",
+        "controls": _ITEM_FILTER_CAPABILITY_CONTROLS,
+    },
+    "item-summary": {
+        "method": "GET",
+        "path": "/api/items/summary",
         "controls": _ITEM_FILTER_CAPABILITY_CONTROLS,
     },
     "capability-discovery": {
@@ -299,6 +307,25 @@ class ApiClient:
         )
         payload = self._get("/api/items/facets", params=params)
         _validate_facet_envelope(payload, expected_filters, normalized_queries)
+        return payload
+
+    def item_summary(
+        self,
+        *,
+        status: str | None = None,
+        category: str | None = None,
+        label: str | None = None,
+        q: str | None = None,
+    ) -> JsonObject:
+        """Return validated provider-owned aggregates for matching items."""
+        params, expected_filters, normalized_queries = _summary_query(
+            status=status,
+            category=category,
+            label=label,
+            q=q,
+        )
+        payload = self._get("/api/items/summary", params=params)
+        _validate_summary_envelope(payload, expected_filters, normalized_queries)
         return payload
 
     def _get(
@@ -564,6 +591,39 @@ def _facet_query(
     label: str | None,
     q: str | None,
 ) -> tuple[dict[str, QueryValue], JsonObject, frozenset[str] | None]:
+    return _filtered_query(
+        status=status,
+        category=category,
+        label=label,
+        q=q,
+        option_group="facet",
+    )
+
+
+def _summary_query(
+    *,
+    status: str | None,
+    category: str | None,
+    label: str | None,
+    q: str | None,
+) -> tuple[dict[str, QueryValue], JsonObject, frozenset[str] | None]:
+    return _filtered_query(
+        status=status,
+        category=category,
+        label=label,
+        q=q,
+        option_group="summary",
+    )
+
+
+def _filtered_query(
+    *,
+    status: str | None,
+    category: str | None,
+    label: str | None,
+    q: str | None,
+    option_group: str,
+) -> tuple[dict[str, QueryValue], JsonObject, frozenset[str] | None]:
     filter_values: dict[str, str | None] = {}
     for name, value in (
         ("status", status),
@@ -574,10 +634,13 @@ def _facet_query(
         canonical_value = _canonical_query_string(
             name,
             value,
-            option_group="facet",
+            option_group=option_group,
         )
         if canonical_value is not None and not _ecmascript_trim(canonical_value):
-            raise ApiError(f"invalid facet option '{name}': expected a non-blank string")
+            raise ApiError(
+                f"invalid {option_group} option '{name}': "
+                "expected a non-blank string"
+            )
         filter_values[name] = canonical_value
 
     status = filter_values["status"]
@@ -784,6 +847,88 @@ def _validate_facet_envelope(
     ):
         raise ApiError(f"{path} returned label counts inconsistent with the request")
 
+    for name, expected_value in expected_filters.items():
+        if not _matches_query_value(
+            name,
+            filters[name],
+            expected_value,
+            normalized_queries,
+        ):
+            raise ApiError(
+                f"{path} returned filter metadata that does not match the request"
+            )
+
+
+def _validate_summary_envelope(
+    payload: JsonObject,
+    expected_filters: JsonObject,
+    normalized_queries: frozenset[str] | None,
+) -> None:
+    path = "GET /api/items/summary"
+    if not _SUMMARY_ENVELOPE_KEYS.issubset(payload):
+        raise ApiError(f"{path} returned an invalid summary envelope")
+
+    data = payload["data"]
+    insights = payload["insights"]
+    if not isinstance(data, dict) or not _SUMMARY_DATA_KEYS.issubset(data):
+        raise ApiError(f"{path} returned invalid summary data")
+    if not isinstance(insights, dict) or not _SUMMARY_INSIGHT_KEYS.issubset(insights):
+        raise ApiError(f"{path} returned invalid summary insights")
+
+    matching_total = data["total"]
+    global_total = insights["total"]
+    insight_matching = insights["matching"]
+    if type(matching_total) is not int or matching_total < 0:
+        raise ApiError(f"{path} returned invalid matching total")
+    if type(global_total) is not int or global_total < 0:
+        raise ApiError(f"{path} returned invalid global total")
+    if type(insight_matching) is not int or insight_matching < 0:
+        raise ApiError(f"{path} returned invalid insight matching total")
+    if insight_matching != matching_total or global_total < matching_total:
+        raise ApiError(f"{path} returned inconsistent summary totals")
+    if not any(expected_filters.values()) and global_total != matching_total:
+        raise ApiError(f"{path} returned inconsistent unfiltered totals")
+
+    grouping_maps = {
+        "status counts": data["byStatus"],
+        "category counts": data["byCategory"],
+        "insight status counts": insights["byStatus"],
+    }
+    for name, counts in grouping_maps.items():
+        if not isinstance(counts, dict) or not all(
+            type(group) is str
+            and bool(group)
+            and type(count) is int
+            and count >= 0
+            for group, count in counts.items()
+        ):
+            raise ApiError(f"{path} returned invalid {name}")
+        if sum(counts.values()) != matching_total:
+            raise ApiError(f"{path} returned {name} inconsistent with the total")
+
+    by_status = data["byStatus"]
+    by_category = data["byCategory"]
+    if insights["byStatus"] != by_status:
+        raise ApiError(f"{path} returned inconsistent status insights")
+
+    requested_status = expected_filters["status"]
+    if (
+        requested_status is not None
+        and matching_total > 0
+        and by_status != {requested_status: matching_total}
+    ):
+        raise ApiError(f"{path} returned status counts inconsistent with the request")
+    requested_category = expected_filters["category"]
+    if (
+        requested_category is not None
+        and matching_total > 0
+        and by_category != {requested_category: matching_total}
+    ):
+        raise ApiError(f"{path} returned category counts inconsistent with the request")
+
+    filters = insights["filters"]
+    if not isinstance(filters, dict) or not _FACET_FILTER_KEYS.issubset(filters):
+        raise ApiError(f"{path} returned invalid filter metadata")
     for name, expected_value in expected_filters.items():
         if not _matches_query_value(
             name,

@@ -141,6 +141,100 @@ class CliTests(unittest.TestCase):
         )
 
     @patch("test_02.cli.ApiClient")
+    def test_summary_prints_deterministic_unfiltered_json(self, client_class) -> None:
+        envelope = {
+            "insights": {
+                "total": 2,
+                "matching": 2,
+                "filters": {
+                    "status": None,
+                    "category": None,
+                    "label": None,
+                    "q": None,
+                },
+                "byStatus": {"inactive": 1, "active": 1},
+            },
+            "data": {
+                "total": 2,
+                "byStatus": {"inactive": 1, "active": 1},
+                "byCategory": {"support-service": 1, "core-service": 1},
+            },
+        }
+        client_class.return_value.item_summary.return_value = envelope
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(["summary"])
+
+        self.assertEqual(result, 0)
+        client_class.return_value.item_summary.assert_called_once_with(
+            status=None,
+            category=None,
+            label=None,
+            q=None,
+        )
+        self.assertEqual(
+            output.getvalue(),
+            json.dumps(envelope, indent=2, sort_keys=True) + "\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
+    def test_summary_delegates_filtered_options_without_recounting(
+        self,
+        client_class,
+    ) -> None:
+        envelope = {
+            "data": {
+                "total": 1,
+                "byStatus": {"active": 1},
+                "byCategory": {"support-service": 1},
+            },
+            "insights": {
+                "total": 2,
+                "matching": 1,
+                "byStatus": {"active": 1},
+                "filters": {
+                    "status": "active",
+                    "category": "support-service",
+                    "label": "support",
+                    "q": "second",
+                },
+            },
+        }
+        client_class.return_value.item_summary.return_value = envelope
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "--base-url",
+                    "http://api.example.test",
+                    "summary",
+                    "--status",
+                    "active",
+                    "--category",
+                    "support-service",
+                    "--label",
+                    "support",
+                    "--q",
+                    " SECOND ",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with("http://api.example.test")
+        client_class.return_value.item_summary.assert_called_once_with(
+            status="active",
+            category="support-service",
+            label="support",
+            q=" SECOND ",
+        )
+        self.assertEqual(
+            output.getvalue(),
+            json.dumps(envelope, indent=2, sort_keys=True) + "\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
     def test_health_keeps_the_existing_command_behavior(self, client_class) -> None:
         client_class.return_value.health.return_value = {"status": "ok"}
         output = io.StringIO()
@@ -202,6 +296,34 @@ class CliTests(unittest.TestCase):
         client_class.assert_not_called()
 
     @patch("test_02.cli.ApiClient")
+    def test_summary_rejects_unsupported_controls_before_client_creation(
+        self,
+        client_class,
+    ) -> None:
+        for option in (
+            ("--sort", "name"),
+            ("--order", "asc"),
+            ("--page", "1"),
+            ("--limit", "20"),
+        ):
+            with self.subTest(option=option):
+                output = io.StringIO()
+                errors = io.StringIO()
+
+                with (
+                    redirect_stdout(output),
+                    redirect_stderr(errors),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    main(["summary", *option])
+
+                self.assertEqual(raised.exception.code, 2)
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn("unrecognized arguments", errors.getvalue())
+
+        client_class.assert_not_called()
+
+    @patch("test_02.cli.ApiClient")
     def test_api_errors_are_reported_without_json_output(self, client_class) -> None:
         client_class.return_value.discover_items.side_effect = ApiError("transport failed")
         output = io.StringIO()
@@ -252,6 +374,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             errors.getvalue(),
             "error: GET /api/items/facets returned invalid facet data\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
+    def test_summary_errors_use_the_existing_cli_error_contract(self, client_class) -> None:
+        client_class.return_value.item_summary.side_effect = ApiError(
+            "GET /api/items/summary returned invalid summary data"
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["summary", "--label", "support"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: GET /api/items/summary returned invalid summary data\n",
         )
 
 
