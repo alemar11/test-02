@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
         "capabilities",
         help="Discover compatible provider capabilities",
     )
+    item = commands.add_parser("item", help="Read one item by exact ID")
+    item.add_argument("item_id", help="Exact item ID")
     items = commands.add_parser("items", help="Discover items")
     items.add_argument("--status", help="Exact status filter")
     items.add_argument("--category", help="Exact category filter")
@@ -89,6 +91,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 page=args.page,
                 limit=args.limit,
             )
+        elif args.command == "item":
+            payload = client.get_item(args.item_id)
         elif args.command == "facets":
             payload = client.item_facets(
                 status=args.status,
