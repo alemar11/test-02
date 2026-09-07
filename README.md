@@ -12,6 +12,7 @@ Start the API in `test-01`, then run one of these commands:
 
 ```bash
 uv run test-02 health
+uv run test-02 --timeout 2.5 items
 uv run test-02 capabilities
 uv run test-02 items
 uv run test-02 items --label featured --status active --sort name --limit 5
@@ -20,10 +21,13 @@ uv run test-02 summary
 uv run test-02 summary --status active --label support --q " SECOND "
 ```
 
-Use `--base-url` before the command to point the client at another local API
-instance. The `items` command supports `--status`, `--category`, `--label`,
-`--q`, `--sort`, `--order`, `--page`, and `--limit`. It prints deterministic,
-sorted-key JSON with the complete discovery envelope:
+Use global `--base-url` and `--timeout` options before the command to point the
+client at another local API instance and set a finite, positive request timeout
+in seconds. The default timeout is `5.0`; invalid timeout values are rejected
+by the argument parser before the client or network is used. The `items`
+command supports `--status`, `--category`, `--label`, `--q`, `--sort`,
+`--order`, `--page`, and `--limit`. It prints deterministic, sorted-key JSON
+with the complete discovery envelope:
 
 ```json
 {
@@ -64,7 +68,7 @@ existing data-only convenience method:
 ```python
 from test_02.client import ApiClient
 
-client = ApiClient("http://127.0.0.1:3000")
+client = ApiClient("http://127.0.0.1:3000", timeout=2.5)
 manifest = client.capabilities()
 envelope = client.discover_items(label="featured", sort="name", limit=5)
 items = client.list_items()

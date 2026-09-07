@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import sys
 from collections.abc import Sequence
 
@@ -30,12 +31,30 @@ def _page(value: str) -> int:
     return parsed
 
 
+def _timeout(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "expected a finite positive number"
+        ) from error
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a finite positive number")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read data from test-01")
     parser.add_argument(
         "--base-url",
         default="http://127.0.0.1:3000",
         help="Base URL of the test-01 API",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=_timeout,
+        default=5.0,
+        help="Request timeout in seconds (must be finite and positive)",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("health", help="Read API health")
@@ -71,7 +90,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "items" and args.order is not None and args.sort is None:
         parser.error("--order requires --sort")
 
-    client = ApiClient(args.base_url)
+    client = ApiClient(args.base_url, timeout=args.timeout)
 
     try:
         if args.command == "health":
