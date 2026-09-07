@@ -350,6 +350,34 @@ class CliTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "error: GET /api/items transport failed\n")
 
     @patch("test_02.cli.ApiClient")
+    def test_export_rejects_malformed_later_records_before_writing_stdout(
+        self,
+        client_class,
+    ) -> None:
+        client_class.return_value.iter_items.return_value = [
+            {
+                "id": "item-1",
+                "name": "First item",
+                "status": "active",
+                "category": "core-service",
+                "labels": [],
+            },
+            {"id": "item-2"},
+        ]
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["export"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: export item field 'name' must be a string\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
     def test_export_rejects_invalid_bounds_and_order_before_client_creation(
         self,
         client_class,

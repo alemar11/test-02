@@ -224,8 +224,9 @@ It supports the same status, category, label, query, sort, and order filters as
 `category`, and `labels`; labels is a compact JSON array in the provider's
 order. Standard-library CSV quoting preserves commas, quotes, and newlines in
 source values. The complete iterator is consumed before the header or any row
-is written, so a later-page failure leaves stdout empty and uses the existing
-`error: ...` stderr response. Empty results write the header only.
+is written, so a later-page or malformed-record failure leaves stdout empty and
+uses the existing `error: ...` stderr response. Empty results write the header
+only.
 
 ## Facet insights
 

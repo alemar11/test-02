@@ -38,6 +38,40 @@ def _page_size(value: str) -> int:
     return parsed
 
 
+def _csv_rows(
+    items: list[dict[str, object]],
+) -> list[tuple[str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ApiError("export item must be an object")
+        scalar_values: list[str] = []
+        for field in ("id", "name", "status", "category"):
+            value = item.get(field)
+            if type(value) is not str:
+                raise ApiError(
+                    f"export item field '{field}' must be a string"
+                )
+            scalar_values.append(value)
+
+        labels = item.get("labels")
+        if not isinstance(labels, list) or not all(
+            type(label) is str for label in labels
+        ):
+            raise ApiError("export item field 'labels' must be a list of strings")
+
+        rows.append(
+            (
+                scalar_values[0],
+                scalar_values[1],
+                scalar_values[2],
+                scalar_values[3],
+                json.dumps(labels, separators=(",", ":")),
+            )
+        )
+    return rows
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read data from test-01")
     parser.add_argument(
@@ -130,18 +164,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     max_pages=args.max_pages,
                 )
             )
+            rows = _csv_rows(items)
             writer = csv.writer(sys.stdout, lineterminator="\n")
             writer.writerow(("id", "name", "status", "category", "labels"))
-            for item in items:
-                writer.writerow(
-                    (
-                        item["id"],
-                        item["name"],
-                        item["status"],
-                        item["category"],
-                        json.dumps(item["labels"], separators=(",", ":")),
-                    )
-                )
+            writer.writerows(rows)
             return 0
         else:
             payload = client.item_summary(
