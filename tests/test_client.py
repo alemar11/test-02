@@ -1,5 +1,8 @@
 import copy
+import json
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 from typing import Any
 
 import requests
@@ -548,6 +551,62 @@ class ApiClientTests(unittest.TestCase):
                     None,
                 )
             ],
+        )
+
+    def test_get_item_preserves_dot_segments_on_real_http_transport(self) -> None:
+        received_paths: list[str] = []
+        known_item = {
+            "id": "item-1",
+            "name": "First item",
+            "status": "active",
+            "category": "core-service",
+            "labels": ["featured", "read-only"],
+        }
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                received_paths.append(self.path)
+                if self.path == "/api/items/item-1":
+                    response_body = json.dumps({"data": known_item}).encode()
+                    self.send_response(200)
+                else:
+                    response_body = json.dumps(
+                        {"error": {"code": "item_not_found"}}
+                    ).encode()
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = ApiClient(
+                f"http://127.0.0.1:{server.server_port}",
+                session=requests.Session(),
+            )
+            self.assertEqual(client.get_item("item-1"), known_item)
+
+            for item_id, encoded_id in ((".", "%2E"), ("..", "%2E%2E")):
+                with self.subTest(item_id=item_id):
+                    with self.assertRaisesRegex(
+                        ApiError,
+                        f"GET /api/items/{encoded_id} returned HTTP 404",
+                    ):
+                        client.get_item(item_id)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+        self.assertEqual(
+            received_paths,
+            ["/api/items/item-1", "/api/items/%2E", "/api/items/%2E%2E"],
         )
 
     def test_get_item_rejects_blank_non_string_and_invalid_unicode_ids_locally(

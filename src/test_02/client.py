@@ -268,8 +268,11 @@ class ApiClient:
     def get_item(self, item_id: str) -> JsonObject:
         """Return the validated item identified by one exact path-segment ID."""
         item_id = _item_id(item_id)
-        encoded_item_id = quote(item_id, safe="")
-        payload = self._get(f"/api/items/{encoded_item_id}")
+        encoded_item_id = _item_path_segment(item_id)
+        payload = self._get(
+            f"/api/items/{encoded_item_id}",
+            preserve_path_encoding=item_id in {".", ".."},
+        )
         _validate_item_envelope(payload, item_id, encoded_item_id)
         return payload["data"]
 
@@ -343,6 +346,7 @@ class ApiClient:
         path: str,
         *,
         params: dict[str, QueryValue] | None = None,
+        preserve_path_encoding: bool = False,
     ) -> JsonObject:
         assert self.session is not None
 
@@ -350,7 +354,19 @@ class ApiClient:
             request_options: dict[str, Any] = {"timeout": self.timeout}
             if params is not None:
                 request_options["params"] = params
-            response = self.session.get(f"{self.base_url}{path}", **request_options)
+            url = f"{self.base_url}{path}"
+            if preserve_path_encoding and isinstance(self.session, requests.Session):
+                # requests' URL preparation decodes percent-encoded unreserved
+                # characters, including the dots in %2E and %2E%2E. Prepare the
+                # request for normal session configuration, then restore the
+                # exact encoded URL before the adapter sends it.
+                prepared = self.session.prepare_request(
+                    requests.Request("GET", url, params=params)
+                )
+                prepared.url = url
+                response = self.session.send(prepared, timeout=self.timeout)
+            else:
+                response = self.session.get(url, **request_options)
         except requests.RequestException as error:
             raise ApiError(f"GET {path} transport failed: {error}") from error
 
@@ -686,6 +702,15 @@ def _item_id(item_id: Any) -> str:
     if not _ecmascript_trim(item_id):
         raise ApiError("invalid item id: expected a non-blank string")
     return item_id
+
+
+def _item_path_segment(item_id: str) -> str:
+    encoded_item_id = quote(item_id, safe="")
+    if item_id == ".":
+        return "%2E"
+    if item_id == "..":
+        return "%2E%2E"
+    return encoded_item_id
 
 
 def _canonical_query_string(
