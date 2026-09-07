@@ -52,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     items.add_argument("--order", choices=("asc", "desc"))
     items.add_argument("--page", type=_page, default=1)
     items.add_argument("--limit", type=_limit, default=20)
+    batch = commands.add_parser("batch", help="Read a bounded batch of items")
+    batch.add_argument("ids", nargs="+", metavar="ID", help="Item IDs to read")
     facets = commands.add_parser("facets", help="Read item label facets")
     facets.add_argument("--status", help="Exact status filter")
     facets.add_argument("--category", help="Exact category filter")
@@ -89,6 +91,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 page=args.page,
                 limit=args.limit,
             )
+        elif args.command == "batch":
+            payload = client.get_items(args.ids)
         elif args.command == "facets":
             payload = client.item_facets(
                 status=args.status,

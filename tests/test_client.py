@@ -4,7 +4,7 @@ from typing import Any
 
 import requests
 
-from test_02.client import MAX_PAGE, ApiClient, ApiError
+from test_02.client import MAX_BATCH_IDS, MAX_PAGE, ApiClient, ApiError
 
 
 def collection_envelope(
@@ -96,6 +96,17 @@ def summary_envelope(
     }
 
 
+def batch_envelope(
+    *,
+    data: list[dict[str, Any]] | None = None,
+    missing: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "data": data if data is not None else [{"id": "item-2"}],
+        "missing": missing if missing is not None else ["missing"],
+    }
+
+
 def capability_manifest() -> dict[str, Any]:
     item_filter_controls = {
         "status": {
@@ -169,6 +180,20 @@ def capability_manifest() -> dict[str, Any]:
                 "method": "GET",
                 "path": "/api/items/facets",
                 "controls": copy.deepcopy(item_filter_controls),
+            },
+            {
+                "id": "item-batch",
+                "method": "GET",
+                "path": "/api/items/batch",
+                "controls": {
+                    "ids": {
+                        "type": "string",
+                        "cardinality": "single",
+                        "nonBlank": True,
+                        "minimum": 1,
+                        "maximum": 50,
+                    },
+                },
             },
             {
                 "id": "item-summary",
@@ -299,6 +324,31 @@ class ApiClientTests(unittest.TestCase):
         )
 
         self.assertIs(client.capabilities(), manifest)
+
+    def test_capabilities_keeps_legacy_manifests_compatible_without_batch(self) -> None:
+        manifest = capability_manifest()
+        manifest["capabilities"] = [
+            capability
+            for capability in manifest["capabilities"]
+            if capability["id"] != "item-batch"
+        ]
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        self.assertIs(client.capabilities(), manifest)
+
+    def test_capabilities_validates_batch_when_provider_advertises_it(self) -> None:
+        manifest = capability_manifest()
+        capability_entry(manifest, "item-batch")["controls"]["ids"]["maximum"] = 49
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(ApiError, "capability 'item-batch'"):
+            client.capabilities()
 
     def test_capabilities_rejects_supported_values_missing_required_choices(
         self,
@@ -521,6 +571,171 @@ class ApiClientTests(unittest.TestCase):
             session.calls,
             [("http://api.example.test/api/items", 5.0, None)],
         )
+
+    def test_get_items_returns_ordered_found_and_missing_partitions(self) -> None:
+        response = batch_envelope(
+            data=[{"id": "item-2", "name": "Second item"}, {"id": "item-1"}],
+            missing=["missing"],
+        )
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            client.get_items(["item-2", "missing", "item-1"]),
+            response,
+        )
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "http://api.example.test/api/items/batch",
+                    5.0,
+                    {"ids": "item-2,missing,item-1"},
+                )
+            ],
+        )
+
+    def test_get_items_accepts_all_known_and_all_missing_batches(self) -> None:
+        for response, ids in (
+            (
+                batch_envelope(
+                    data=[{"id": "item-1"}, {"id": "item-2"}],
+                    missing=[],
+                ),
+                ["item-1", "item-2"],
+            ),
+            (
+                batch_envelope(data=[], missing=["missing-a", "missing-b"]),
+                ["missing-a", "missing-b"],
+            ),
+        ):
+            with self.subTest(response=response):
+                session = FakeSession(FakeResponse(response))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                self.assertEqual(client.get_items(ids), response)
+
+    def test_invalid_batch_ids_fail_before_a_request(self) -> None:
+        invalid_ids: tuple[Any, ...] = (
+            None,
+            (),
+            "item-1",
+            [],
+            [""],
+            ["item 1"],
+            ["item-1", "item-1"],
+            ["item-1", 1],
+            ["item-1", "bad,id"],
+            ["item-1"] * (MAX_BATCH_IDS + 1),
+        )
+
+        for ids in invalid_ids:
+            with self.subTest(ids=ids):
+                session = FakeSession(FakeResponse(batch_envelope()))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "invalid batch"):
+                    client.get_items(ids)  # type: ignore[arg-type]
+
+                self.assertEqual(session.calls, [])
+
+    def test_get_items_rejects_malformed_or_inconsistent_partitions(self) -> None:
+        requested_ids = ["item-2", "missing", "item-1"]
+        invalid_responses = []
+
+        missing_data = batch_envelope()
+        del missing_data["data"]
+        invalid_responses.append(missing_data)
+
+        extra_field = batch_envelope()
+        extra_field["extra"] = True
+        invalid_responses.append(extra_field)
+
+        invalid_item = batch_envelope(data=[{"name": "missing id"}], missing=["item-1", "item-2"])
+        invalid_responses.append(invalid_item)
+
+        unknown_item = batch_envelope(data=[{"id": "item-3"}], missing=["missing", "item-1"])
+        invalid_responses.append(unknown_item)
+
+        duplicate_item = batch_envelope(
+            data=[{"id": "item-2"}, {"id": "item-2"}],
+            missing=["missing", "item-1"],
+        )
+        invalid_responses.append(duplicate_item)
+
+        unknown_missing = batch_envelope(
+            data=[{"id": "item-2"}, {"id": "item-1"}],
+            missing=["other"],
+        )
+        invalid_responses.append(unknown_missing)
+
+        duplicate_missing = batch_envelope(
+            data=[{"id": "item-2"}, {"id": "item-1"}],
+            missing=["missing", "missing"],
+        )
+        invalid_responses.append(duplicate_missing)
+
+        overlap = batch_envelope(data=[{"id": "item-2"}], missing=["item-2", "missing", "item-1"])
+        invalid_responses.append(overlap)
+
+        wrong_found_order = batch_envelope(
+            data=[{"id": "item-1"}, {"id": "item-2"}],
+            missing=["missing"],
+        )
+        invalid_responses.append(wrong_found_order)
+
+        wrong_missing_order = batch_envelope(
+            data=[{"id": "item-1"}],
+            missing=["missing", "item-2"],
+        )
+        invalid_responses.append(wrong_missing_order)
+
+        for response in invalid_responses:
+            with self.subTest(response=response):
+                session = FakeSession(FakeResponse(copy.deepcopy(response)))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "GET /api/items/batch returned"):
+                    client.get_items(requested_ids)
+
+    def test_get_items_preserves_transport_http_json_and_shape_errors(self) -> None:
+        cases = (
+            (
+                FakeSession(error=requests.ConnectionError("offline")),
+                "GET /api/items/batch transport failed",
+            ),
+            (
+                FakeSession(FakeResponse({}, status_code=422)),
+                "GET /api/items/batch returned HTTP 422",
+            ),
+            (
+                FakeSession(FakeResponse({}, json_error=ValueError("bad json"))),
+                "GET /api/items/batch returned invalid JSON",
+            ),
+            (
+                FakeSession(FakeResponse([])),
+                "GET /api/items/batch returned a non-object JSON payload",
+            ),
+        )
+
+        for session, message in cases:
+            with self.subTest(message=message):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, message):
+                    client.get_items(["item-1"])
 
     def test_discover_items_transports_all_supported_query_controls(self) -> None:
         expected_query = {

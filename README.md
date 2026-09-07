@@ -15,6 +15,7 @@ uv run test-02 health
 uv run test-02 capabilities
 uv run test-02 items
 uv run test-02 items --label featured --status active --sort name --limit 5
+uv run test-02 batch item-2 missing item-1
 uv run test-02 facets --label read-only --status active
 uv run test-02 summary
 uv run test-02 summary --status active --label support --q " SECOND "
@@ -68,6 +69,7 @@ client = ApiClient("http://127.0.0.1:3000")
 manifest = client.capabilities()
 envelope = client.discover_items(label="featured", sort="name", limit=5)
 items = client.list_items()
+batch = client.get_items(["item-2", "missing", "item-1"])
 facets = client.item_facets(label="read-only", status="active")
 summary = client.item_summary(label="support", status="active", q=" second ")
 ```
@@ -91,9 +93,11 @@ behavior, sorting, normalization, defaults, pagination range, and result limit
 must remain compatible.
 
 Compatibility is subset-based: new capability IDs and fields are preserved in
-the returned manifest and printed output. Missing or duplicate identities,
-malformed entries, incompatible required semantics, unsupported schemas,
-transport or HTTP failures, and invalid JSON fail closed with `ApiError`.
+the returned manifest and printed output. The `item-batch` capability is
+additive, so older manifests remain valid; when present, its path and scalar
+`ids` bounds are validated. Missing or duplicate identities, malformed entries,
+incompatible required semantics, unsupported schemas, transport or HTTP
+failures, and invalid JSON fail closed with `ApiError`.
 Discovery is never inferred from another endpoint and has no cache or stale
 fallback. The CLI prints sorted-key JSON on success; failures print only the
 established `error: ...` stderr line and exit with status `1`.
@@ -114,6 +118,54 @@ unsupported Python runtime, or unavailable package metadata are reported in
 the JSON and produce exit status `1`. This command is independent from the
 live `test-02 health` and `test-02 items` commands and never makes a network
 request.
+
+## Ordered batch reads
+
+The `batch` command and `ApiClient.get_items()` read several exact item IDs in
+one request. IDs must be a non-empty list of 1–50 unique strings matching
+`[A-Za-z0-9_-]+`. The client sends them as the single scalar `ids` query value
+and validates that found items and missing IDs are disjoint, complete, and in
+the same order as the request.
+
+Run a mixed batch, including an unknown ID:
+
+```bash
+uv run test-02 batch item-2 missing item-1
+```
+
+The command prints the complete sorted-key response envelope:
+
+```json
+{
+  "data": [
+    {
+      "id": "item-2",
+      "name": "Second item"
+    },
+    {
+      "id": "item-1",
+      "name": "First item"
+    }
+  ],
+  "missing": [
+    "missing"
+  ]
+}
+```
+
+Python callers use the same validated operation:
+
+```python
+from test_02.client import ApiClient
+
+client = ApiClient("http://127.0.0.1:3000")
+batch = client.get_items(["item-2", "missing", "item-1"])
+```
+
+Malformed input is rejected before HTTP. Malformed or inconsistent partitions,
+transport failures, HTTP errors, invalid JSON, and non-object responses raise
+`ApiError`; the CLI reports those failures on stderr using the established
+`error: ...` format and exits with status `1`.
 
 ## Item summaries
 
@@ -252,6 +304,37 @@ uv run test-02 --base-url http://127.0.0.1:3000 capabilities
 The command must exit `0` with deterministic sorted-key schema version 1 JSON.
 After stopping the server, repeat the provider SHA and cleanliness checks to
 confirm that verification did not change provider state.
+
+The ordered batch contract is checked against the pinned `test-01` provider
+candidate `d63d09b81dc85b5f6b94327b0fbadaa2d08b3bc6` on
+`codex/catalog-batch-provider`. It advertises the additive `item-batch`
+capability and serves `GET /api/items/batch?ids=item-2,missing,item-1` with
+found items and missing IDs in their requested order. The consumer validates
+this response over loopback without sharing Git history with or modifying the
+provider repository.
+
+To reproduce the batch contract in an isolated provider checkout:
+
+```bash
+provider_worktree="$(mktemp -d)"
+git clone https://github.com/alemar11/test-01.git "$provider_worktree"
+git -C "$provider_worktree" fetch origin codex/catalog-batch-provider
+git -C "$provider_worktree" checkout --detach d63d09b81dc85b5f6b94327b0fbadaa2d08b3bc6
+test -z "$(git -C "$provider_worktree" status --porcelain)"
+cd "$provider_worktree"
+npm ci
+npm start
+```
+
+Then run the consumer against that server:
+
+```bash
+uv run test-02 --base-url http://127.0.0.1:3000 batch item-2 missing item-1
+```
+
+The result must contain `item-2` and `item-1` in `data`, and `missing` in the
+`missing` array. Stop the server and repeat the provider SHA and cleanliness
+checks after the read-only integration test.
 
 The item-summary client contract is also checked against `test-01` `main` at
 [provider commit
