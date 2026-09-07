@@ -34,15 +34,20 @@ def facet_envelope(
     *,
     total: int = 2,
     by_label: dict[str, int] | None = None,
+    by_category: dict[str, int] | None = None,
+    include_by_category: bool = False,
     filters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    data = {
+        "total": total,
+        "byLabel": by_label
+        if by_label is not None
+        else {"featured": 1, "read-only": 2, "support": 1},
+    }
+    if include_by_category:
+        data["byCategory"] = by_category
     return {
-        "data": {
-            "total": total,
-            "byLabel": by_label
-            if by_label is not None
-            else {"featured": 1, "read-only": 2, "support": 1},
-        },
+        "data": data,
         "filters": filters
         if filters is not None
         else {
@@ -639,6 +644,12 @@ class ApiClientTests(unittest.TestCase):
                 total=2,
                 by_label={"featured": 1, "read-only": 2, "support": 1},
             ),
+            facet_envelope(
+                total=2,
+                by_label={"featured": 1, "read-only": 2, "support": 1},
+                by_category={"core-service": 1, "support-service": 1},
+                include_by_category=True,
+            ),
         )
 
         for response in valid_responses:
@@ -654,6 +665,22 @@ class ApiClientTests(unittest.TestCase):
                     session.calls,
                     [("http://api.example.test/api/items/facets", 5.0, {})],
                 )
+
+    def test_item_facets_preserves_additive_envelope_fields(self) -> None:
+        response = facet_envelope(
+            by_category={"core-service": 1, "support-service": 1},
+            include_by_category=True,
+        )
+        response["provider"] = {"version": 1}
+        response["data"]["futureAggregate"] = {"core-service": 1}
+        response["filters"]["futureFilter"] = None
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient(
+            "http://api.example.test",
+            session=session,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(client.item_facets(), response)
 
     def test_item_summary_transports_supported_filters_and_validates_insights(
         self,
@@ -1036,10 +1063,6 @@ class ApiClientTests(unittest.TestCase):
         del missing_filters["filters"]
         invalid_envelopes.append(missing_filters)
 
-        extra_field = facet_envelope()
-        extra_field["unexpected"] = None
-        invalid_envelopes.append(extra_field)
-
         incomplete_data = facet_envelope()
         del incomplete_data["data"]["byLabel"]
         invalid_envelopes.append(incomplete_data)
@@ -1073,6 +1096,58 @@ class ApiClientTests(unittest.TestCase):
             by_label={"featured": 1},
         )
         invalid_envelopes.append(labels_for_zero_matches)
+
+        invalid_category_map = facet_envelope(
+            by_category=None,
+            include_by_category=True,
+        )
+        invalid_envelopes.append(invalid_category_map)
+
+        blank_category = facet_envelope(
+            by_category={" ": 2},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(blank_category)
+
+        boolean_category_count = facet_envelope(
+            by_category={"core-service": True},  # type: ignore[dict-item]
+            include_by_category=True,
+        )
+        invalid_envelopes.append(boolean_category_count)
+
+        zero_category_count = facet_envelope(
+            by_category={"core-service": 0},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(zero_category_count)
+
+        negative_category_count = facet_envelope(
+            by_category={"core-service": -1},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(negative_category_count)
+
+        category_counts_above_total = facet_envelope(
+            total=1,
+            by_label={"featured": 1},
+            by_category={"core-service": 2},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(category_counts_above_total)
+
+        category_counts_below_total = facet_envelope(
+            by_category={"core-service": 1},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(category_counts_below_total)
+
+        categories_for_zero_matches = facet_envelope(
+            total=0,
+            by_label={},
+            by_category={"core-service": 1},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(categories_for_zero_matches)
 
         incomplete_filters = facet_envelope()
         del incomplete_filters["filters"]["category"]
@@ -1111,6 +1186,25 @@ class ApiClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ApiError, "inconsistent with the request"):
             client.item_facets(label="featured")
+
+        category_mismatch = facet_envelope(
+            by_category={"core-service": 1, "support-service": 1},
+            include_by_category=True,
+            filters={
+                "status": None,
+                "category": "core-service",
+                "label": None,
+                "q": None,
+            },
+        )
+        session = FakeSession(FakeResponse(category_mismatch))
+        client = ApiClient(
+            "http://api.example.test",
+            session=session,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(ApiError, "inconsistent with the request"):
+            client.item_facets(category="core-service")
 
     def test_item_facets_preserves_transport_http_json_and_shape_errors(self) -> None:
         cases = (
