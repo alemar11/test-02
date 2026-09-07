@@ -210,6 +210,23 @@ whole iteration. If a later page fails validation or transport, earlier items
 may already have been yielded; callers that need all-or-nothing output should
 buffer the iterator before writing results.
 
+## CSV export
+
+The `export` command writes the complete matching catalog to standard output:
+
+```bash
+uv run test-02 export --sort name --order asc --page-size 100 --max-pages 1000
+```
+
+It supports the same status, category, label, query, sort, and order filters as
+`items`, plus `--page-size` (1 through 100, default 100) and `--max-pages`
+(positive integer, default 1000). The CSV columns are `id`, `name`, `status`,
+`category`, and `labels`; labels is a compact JSON array in the provider's
+order. Standard-library CSV quoting preserves commas, quotes, and newlines in
+source values. The complete iterator is consumed before the header or any row
+is written, so a later-page failure leaves stdout empty and uses the existing
+`error: ...` stderr response. Empty results write the header only.
+
 ## Facet insights
 
 The `facets` command and `ApiClient.item_facets()` request server-owned label

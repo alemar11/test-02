@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import sys
 from collections.abc import Sequence
@@ -27,6 +28,13 @@ def _page(value: str) -> int:
     parsed = _positive_int(value)
     if parsed > MAX_PAGE:
         raise argparse.ArgumentTypeError(f"expected an integer from 1 to {MAX_PAGE}")
+    return parsed
+
+
+def _page_size(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 100:
+        raise argparse.ArgumentTypeError("expected an integer from 1 to 100")
     return parsed
 
 
@@ -62,13 +70,26 @@ def build_parser() -> argparse.ArgumentParser:
     summary.add_argument("--category", help="Exact category filter")
     summary.add_argument("--label", help="Exact label membership filter")
     summary.add_argument("--q", help="Case-insensitive item name search")
+    export = commands.add_parser("export", help="Export matching items as CSV")
+    export.add_argument("--status", help="Exact status filter")
+    export.add_argument("--category", help="Exact category filter")
+    export.add_argument("--label", help="Exact label membership filter")
+    export.add_argument("--q", help="Case-insensitive item name search")
+    export.add_argument("--sort", choices=("id", "name", "status"))
+    export.add_argument("--order", choices=("asc", "desc"))
+    export.add_argument("--page-size", type=_page_size, default=100)
+    export.add_argument("--max-pages", type=_positive_int, default=1000)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == "items" and args.order is not None and args.sort is None:
+    if (
+        args.command in {"items", "export"}
+        and args.order is not None
+        and args.sort is None
+    ):
         parser.error("--order requires --sort")
 
     client = ApiClient(args.base_url)
@@ -96,6 +117,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                 label=args.label,
                 q=args.q,
             )
+        elif args.command == "export":
+            items = list(
+                client.iter_items(
+                    status=args.status,
+                    category=args.category,
+                    label=args.label,
+                    q=args.q,
+                    sort=args.sort,
+                    order=args.order,
+                    page_size=args.page_size,
+                    max_pages=args.max_pages,
+                )
+            )
+            writer = csv.writer(sys.stdout, lineterminator="\n")
+            writer.writerow(("id", "name", "status", "category", "labels"))
+            for item in items:
+                writer.writerow(
+                    (
+                        item["id"],
+                        item["name"],
+                        item["status"],
+                        item["category"],
+                        json.dumps(item["labels"], separators=(",", ":")),
+                    )
+                )
+            return 0
         else:
             payload = client.item_summary(
                 status=args.status,
