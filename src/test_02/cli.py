@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     items.add_argument("--category", help="Exact category filter")
     items.add_argument("--label", help="Exact label membership filter")
     items.add_argument("--q", help="Case-insensitive item name search")
-    items.add_argument("--sort", choices=("id", "name", "status"))
+    items.add_argument("--sort", choices=("id", "name", "status", "category"))
     items.add_argument("--order", choices=("asc", "desc"))
     items.add_argument("--page", type=_page, default=1)
     items.add_argument("--limit", type=_limit, default=20)

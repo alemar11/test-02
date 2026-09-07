@@ -94,6 +94,41 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), json.dumps(envelope, indent=2, sort_keys=True) + "\n")
 
     @patch("test_02.cli.ApiClient")
+    def test_items_accepts_category_sort(self, client_class) -> None:
+        envelope = {
+            "data": [{"category": "core-service", "id": "item-1"}],
+            "pagination": {"totalPages": 2, "total": 2, "page": 1, "limit": 1},
+            "query": {
+                "status": None,
+                "category": None,
+                "label": None,
+                "q": None,
+                "sort": "category",
+                "order": "asc",
+                "page": 1,
+                "limit": 1,
+            },
+        }
+        client_class.return_value.discover_items.return_value = envelope
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(["items", "--sort", "category", "--limit", "1"])
+
+        self.assertEqual(result, 0)
+        client_class.return_value.discover_items.assert_called_once_with(
+            status=None,
+            category=None,
+            label=None,
+            q=None,
+            sort="category",
+            order=None,
+            page=1,
+            limit=1,
+        )
+        self.assertEqual(output.getvalue(), json.dumps(envelope, indent=2, sort_keys=True) + "\n")
+
+    @patch("test_02.cli.ApiClient")
     def test_facets_prints_deterministic_filtered_label_counts(self, client_class) -> None:
         envelope = {
             "data": {
