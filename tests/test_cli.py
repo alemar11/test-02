@@ -38,6 +38,35 @@ class CliTests(unittest.TestCase):
         )
 
     @patch("test_02.cli.ApiClient")
+    def test_vocabulary_prints_deterministic_sorted_key_json(self, client_class) -> None:
+        envelope = {
+            "data": {
+                "labels": ["featured", "read-only", "support"],
+                "categories": ["core-service", "support-service"],
+                "statuses": ["active"],
+            }
+        }
+        client_class.return_value.item_vocabulary.return_value = envelope
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "--base-url",
+                    "http://api.example.test",
+                    "vocabulary",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with("http://api.example.test")
+        client_class.return_value.item_vocabulary.assert_called_once_with()
+        self.assertEqual(
+            output.getvalue(),
+            json.dumps(envelope, indent=2, sort_keys=True) + "\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
     def test_items_prints_the_deterministic_discovery_envelope(self, client_class) -> None:
         envelope = {
             "data": [{"labels": ["featured"], "id": "item-1"}],
@@ -356,6 +385,24 @@ class CliTests(unittest.TestCase):
             errors.getvalue(),
             "error: GET /api/capabilities returned unsupported schema version 2; "
             "expected 1\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
+    def test_vocabulary_errors_use_the_existing_cli_error_contract(self, client_class) -> None:
+        client_class.return_value.item_vocabulary.side_effect = ApiError(
+            "GET /api/items/vocabulary returned unordered vocabulary statuses"
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["vocabulary"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: GET /api/items/vocabulary returned unordered vocabulary statuses\n",
         )
 
     @patch("test_02.cli.ApiClient")

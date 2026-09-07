@@ -96,6 +96,29 @@ def summary_envelope(
     }
 
 
+def vocabulary_envelope(
+    *,
+    statuses: list[str] | None = None,
+    categories: list[str] | None = None,
+    labels: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "data": {
+            "statuses": statuses if statuses is not None else ["active", "inactive"],
+            "categories": (
+                categories
+                if categories is not None
+                else ["core-service", "support-service"]
+            ),
+            "labels": (
+                labels
+                if labels is not None
+                else ["featured", "read-only", "support"]
+            ),
+        }
+    }
+
+
 def capability_manifest() -> dict[str, Any]:
     item_filter_controls = {
         "status": {
@@ -299,6 +322,38 @@ class ApiClientTests(unittest.TestCase):
         )
 
         self.assertIs(client.capabilities(), manifest)
+
+    def test_capabilities_accepts_and_validates_optional_vocabulary(self) -> None:
+        manifest = capability_manifest()
+        manifest["capabilities"].append(
+            {
+                "id": "item-vocabulary",
+                "method": "GET",
+                "path": "/api/items/vocabulary",
+                "documentation": {"stability": "stable"},
+            }
+        )
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        self.assertIs(client.capabilities(), manifest)
+
+        for field, value in (("method", "POST"), ("path", "/api/vocabulary")):
+            with self.subTest(field=field):
+                incompatible = copy.deepcopy(manifest)
+                capability_entry(incompatible, "item-vocabulary")[field] = value
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=FakeSession(FakeResponse(incompatible)),  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(
+                    ApiError,
+                    "returned incompatible capability 'item-vocabulary'",
+                ):
+                    client.capabilities()
 
     def test_capabilities_rejects_supported_values_missing_required_choices(
         self,
@@ -730,6 +785,109 @@ class ApiClientTests(unittest.TestCase):
                 )
 
                 self.assertEqual(client.item_summary(**options), response)
+
+    def test_item_vocabulary_preserves_the_full_sorted_envelope(self) -> None:
+        response = vocabulary_envelope()
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertIs(client.item_vocabulary(), response)
+        self.assertEqual(
+            session.calls,
+            [("http://api.example.test/api/items/vocabulary", 5.0, None)],
+        )
+
+    def test_item_vocabulary_accepts_empty_arrays(self) -> None:
+        response = vocabulary_envelope(statuses=[], categories=[], labels=[])
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(response)),  # type: ignore[arg-type]
+        )
+
+        self.assertIs(client.item_vocabulary(), response)
+
+    def test_item_vocabulary_uses_javascript_ordinal_sorting(self) -> None:
+        response = vocabulary_envelope(
+            statuses=["a", "\U0001f600"],
+            categories=["a", "\ue000"],
+            labels=["A", "a"],
+        )
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(response)),  # type: ignore[arg-type]
+        )
+
+        self.assertIs(client.item_vocabulary(), response)
+
+    def test_item_vocabulary_rejects_malformed_arrays_duplicates_and_order(self) -> None:
+        invalid_responses = []
+
+        missing_data = vocabulary_envelope()
+        del missing_data["data"]
+        invalid_responses.append(missing_data)
+
+        extra_field = vocabulary_envelope()
+        extra_field["provider"] = {"version": 1}
+        invalid_responses.append(extra_field)
+
+        incomplete_data = vocabulary_envelope()
+        del incomplete_data["data"]["labels"]
+        invalid_responses.append(incomplete_data)
+
+        for name, values in (
+            ("statuses", None),
+            ("categories", ["core-service", 1]),
+            ("labels", ["support", " "]),
+            ("statuses", ["active", "active"]),
+            ("categories", ["support-service", "core-service"]),
+            ("labels", ["\ue000", "\U0001f600"]),
+        ):
+            response = vocabulary_envelope()
+            response["data"][name] = values
+            invalid_responses.append(response)
+
+        for response in invalid_responses:
+            with self.subTest(response=response):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=FakeSession(FakeResponse(copy.deepcopy(response))),  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(
+                    ApiError,
+                    "GET /api/items/vocabulary returned",
+                ):
+                    client.item_vocabulary()
+
+    def test_item_vocabulary_preserves_transport_http_json_and_shape_errors(self) -> None:
+        cases = (
+            (
+                FakeSession(error=requests.ConnectionError("offline")),
+                "GET /api/items/vocabulary transport failed",
+            ),
+            (
+                FakeSession(FakeResponse({}, status_code=422)),
+                "GET /api/items/vocabulary returned HTTP 422",
+            ),
+            (
+                FakeSession(FakeResponse({}, json_error=ValueError("bad json"))),
+                "GET /api/items/vocabulary returned invalid JSON",
+            ),
+            (
+                FakeSession(FakeResponse([])),
+                "GET /api/items/vocabulary returned a non-object JSON payload",
+            ),
+        )
+
+        for session, message in cases:
+            with self.subTest(message=message):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, message):
+                    client.item_vocabulary()
 
     def test_discover_items_normalizes_string_subclasses_to_json_strings(self) -> None:
         response = collection_envelope(

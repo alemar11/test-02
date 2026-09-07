@@ -26,9 +26,12 @@ _FACET_FILTER_KEYS = {"status", "category", "label", "q"}
 _SUMMARY_ENVELOPE_KEYS = {"data", "insights"}
 _SUMMARY_DATA_KEYS = {"total", "byStatus", "byCategory"}
 _SUMMARY_INSIGHT_KEYS = {"total", "matching", "byStatus", "filters"}
+_VOCABULARY_ENVELOPE_KEYS = {"data"}
+_VOCABULARY_DATA_KEYS = {"statuses", "categories", "labels"}
 _SORT_FIELDS = {"id", "name", "status"}
 _SORT_ORDERS = {"asc", "desc"}
 _CAPABILITY_PATH = "GET /api/capabilities"
+_VOCABULARY_PATH = "GET /api/items/vocabulary"
 _SUPPORTED_CAPABILITY_SCHEMA_VERSION = 1
 _ITEM_FILTER_CAPABILITY_CONTROLS: JsonObject = {
     "status": {
@@ -110,6 +113,12 @@ _REQUIRED_CAPABILITIES: dict[str, JsonObject] = {
     "capability-discovery": {
         "method": "GET",
         "path": "/api/capabilities",
+    },
+}
+_OPTIONAL_CAPABILITIES: dict[str, JsonObject] = {
+    "item-vocabulary": {
+        "method": "GET",
+        "path": "/api/items/vocabulary",
     },
 }
 _ECMASCRIPT_TRIM_CHARACTERS = (
@@ -328,6 +337,12 @@ class ApiClient:
         _validate_summary_envelope(payload, expected_filters, normalized_queries)
         return payload
 
+    def item_vocabulary(self) -> JsonObject:
+        """Return the validated complete vocabulary for item filters."""
+        payload = self._get("/api/items/vocabulary")
+        _validate_vocabulary_envelope(payload)
+        return payload
+
     def _get(
         self,
         path: str,
@@ -416,6 +431,15 @@ def _validate_capability_manifest(payload: JsonObject) -> None:
             required_fields,
             location=f"capability {capability_id!r}",
         )
+
+    for capability_id, required_fields in _OPTIONAL_CAPABILITIES.items():
+        capability = capabilities_by_id.get(capability_id)
+        if capability is not None:
+            _validate_required_capability_subset(
+                capability,
+                required_fields,
+                location=f"capability {capability_id!r}",
+            )
 
 
 def _validate_required_capability_subset(
@@ -939,6 +963,43 @@ def _validate_summary_envelope(
             raise ApiError(
                 f"{path} returned filter metadata that does not match the request"
             )
+
+
+def _validate_vocabulary_envelope(payload: JsonObject) -> None:
+    if set(payload) != _VOCABULARY_ENVELOPE_KEYS:
+        raise ApiError(f"{_VOCABULARY_PATH} returned an invalid vocabulary envelope")
+
+    data = payload["data"]
+    if not isinstance(data, dict) or set(data) != _VOCABULARY_DATA_KEYS:
+        raise ApiError(f"{_VOCABULARY_PATH} returned invalid vocabulary data")
+
+    for name in ("statuses", "categories", "labels"):
+        values = data[name]
+        if not isinstance(values, list):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned invalid vocabulary {name}"
+            )
+        if not all(type(value) is str for value in values):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned invalid vocabulary {name}"
+            )
+        if any(not _ecmascript_trim(value) for value in values):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned blank vocabulary {name}"
+            )
+        if len(set(values)) != len(values):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned duplicate vocabulary {name}"
+            )
+        if values != sorted(values, key=_ecmascript_ordinal_key):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned unordered vocabulary {name}"
+            )
+
+
+def _ecmascript_ordinal_key(value: str) -> bytes:
+    """Match JavaScript's default Array.sort() UTF-16 code-unit ordering."""
+    return value.encode("utf-16-be", "surrogatepass")
 
 
 def _matches_query_value(
