@@ -103,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     item = commands.add_parser("item", help="Read one item by exact ID")
     item.add_argument("item_id", help="Exact item ID")
+    commands.add_parser(
+        "vocabulary",
+        help="Read available item status, category, and label values",
+    )
     items = commands.add_parser("items", help="Discover items")
     items.add_argument("--status", help="Exact status filter")
     items.add_argument("--category", help="Exact category filter")
@@ -153,6 +157,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = client.health()
         elif args.command == "capabilities":
             payload = client.capabilities()
+        elif args.command == "vocabulary":
+            payload = client.item_vocabulary()
         elif args.command == "items":
             payload = client.discover_items(
                 status=args.status,

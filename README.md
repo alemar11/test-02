@@ -15,6 +15,7 @@ uv run test-02 health
 uv run test-02 --timeout 2.5 items
 uv run test-02 capabilities
 uv run test-02 item item-1
+uv run test-02 vocabulary
 uv run test-02 items
 uv run test-02 items --label featured --status active --sort name --limit 5
 uv run test-02 batch item-2 missing item-1
@@ -77,6 +78,7 @@ items = client.list_items()
 batch = client.get_items(["item-2", "missing", "item-1"])
 facets = client.item_facets(label="read-only", status="active")
 summary = client.item_summary(label="support", status="active", q=" second ")
+vocabulary = client.item_vocabulary()
 ```
 
 `discover_items()` validates options locally before sending a request. Blank
@@ -117,7 +119,8 @@ version `1` only and validate the unique capability identities plus the
 required consumer contract for health, item collection, item facets, and
 item summaries, and capability discovery. Required methods, paths, filter
 behavior, sorting, normalization, defaults, pagination range, and result limit
-must remain compatible.
+must remain compatible. The optional `item-vocabulary` capability is validated
+when advertised, while older manifests without it remain compatible.
 
 Compatibility is subset-based: new capability IDs and fields are preserved in
 the returned manifest and printed output. The `item-batch` capability is
@@ -128,6 +131,34 @@ failures, and invalid JSON fail closed with `ApiError`.
 Discovery is never inferred from another endpoint and has no cache or stale
 fallback. The CLI prints sorted-key JSON on success; failures print only the
 established `error: ...` stderr line and exit with status `1`.
+
+## Item vocabulary
+
+The `vocabulary` command and `ApiClient.item_vocabulary()` request the complete
+provider-owned set of status, category, and label values without downloading
+the item collection:
+
+```bash
+uv run test-02 vocabulary
+```
+
+The client preserves and returns the complete response envelope:
+
+```json
+{
+  "data": {
+    "categories": ["core-service", "support-service"],
+    "labels": ["featured", "read-only", "support"],
+    "statuses": ["active"]
+  }
+}
+```
+
+Each array may be empty, but every value must be a non-blank string. Values
+must be unique and sorted with JavaScript's ordinal UTF-16 ordering, matching
+the provider's deterministic `Array.sort()` contract. Malformed, duplicate, or
+unordered arrays fail with `ApiError`; the CLI reports the established
+`error: ...` message and exits with status `1`.
 
 ## Offline environment diagnostics
 
@@ -474,6 +505,24 @@ The unit tests exercise the same exact response keys, optional category map,
 legacy label-only response, filter normalization, empty-map, multi-label,
 unsupported-control, and error contracts without contacting or changing
 `test-01`.
+
+The vocabulary contract is tested against the provider candidate at commit
+[`e22285c39b8748aab84ff5eb691f4853c8a38c19`](https://github.com/alemar11/test-01/commit/e22285c39b8748aab84ff5eb691f4853c8a38c19).
+That candidate advertises the optional `item-vocabulary` capability and serves
+the exact `{ "data": { "statuses": [], "categories": [], "labels": [] } }`
+envelope. To reproduce the pinned loopback check:
+
+```bash
+git clone https://github.com/alemar11/test-01.git /tmp/test-01-vocabulary-contract
+git -C /tmp/test-01-vocabulary-contract checkout --detach e22285c39b8748aab84ff5eb691f4853c8a38c19
+npm --prefix /tmp/test-01-vocabulary-contract ci
+npm --prefix /tmp/test-01-vocabulary-contract start
+```
+
+Then run `uv run test-02 --base-url http://127.0.0.1:3000 capabilities` and
+`uv run test-02 --base-url http://127.0.0.1:3000 vocabulary` from this
+repository. The vocabulary arrays must remain unique, non-blank, and in
+JavaScript ordinal order; the provider must reject any vocabulary query.
 
 Run the tests and syntax check with:
 

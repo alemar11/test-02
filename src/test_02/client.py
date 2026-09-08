@@ -31,11 +31,14 @@ _SUMMARY_ENVELOPE_KEYS = {"data", "insights"}
 _SUMMARY_DATA_KEYS = {"total", "byStatus", "byCategory"}
 _SUMMARY_INSIGHT_KEYS = {"total", "matching", "byStatus", "filters"}
 _BATCH_ENVELOPE_KEYS = {"data", "missing"}
+_VOCABULARY_ENVELOPE_KEYS = {"data"}
+_VOCABULARY_DATA_KEYS = {"statuses", "categories", "labels"}
 _SORT_FIELDS = {"id", "name", "status"}
 _SORT_ORDERS = {"asc", "desc"}
 MAX_BATCH_IDS = 50
 _ITEM_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 _CAPABILITY_PATH = "GET /api/capabilities"
+_VOCABULARY_PATH = "GET /api/items/vocabulary"
 _SUPPORTED_CAPABILITY_SCHEMA_VERSION = 1
 _ITEM_FILTER_CAPABILITY_CONTROLS: JsonObject = {
     "status": {
@@ -132,6 +135,10 @@ _OPTIONAL_CAPABILITIES: dict[str, JsonObject] = {
                 "maximum": MAX_BATCH_IDS,
             },
         },
+    },
+    "item-vocabulary": {
+        "method": "GET",
+        "path": "/api/items/vocabulary",
     },
 }
 _ECMASCRIPT_TRIM_CHARACTERS = (
@@ -471,6 +478,12 @@ class ApiClient:
 
             seen_ids.update(page_ids)
             yield from page_items
+
+    def item_vocabulary(self) -> JsonObject:
+        """Return the validated complete vocabulary for item filters."""
+        payload = self._get("/api/items/vocabulary")
+        _validate_vocabulary_envelope(payload)
+        return payload
 
     def _get(
         self,
@@ -1250,6 +1263,43 @@ def _validate_summary_envelope(
             raise ApiError(
                 f"{path} returned filter metadata that does not match the request"
             )
+
+
+def _validate_vocabulary_envelope(payload: JsonObject) -> None:
+    if set(payload) != _VOCABULARY_ENVELOPE_KEYS:
+        raise ApiError(f"{_VOCABULARY_PATH} returned an invalid vocabulary envelope")
+
+    data = payload["data"]
+    if not isinstance(data, dict) or set(data) != _VOCABULARY_DATA_KEYS:
+        raise ApiError(f"{_VOCABULARY_PATH} returned invalid vocabulary data")
+
+    for name in ("statuses", "categories", "labels"):
+        values = data[name]
+        if not isinstance(values, list):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned invalid vocabulary {name}"
+            )
+        if not all(type(value) is str for value in values):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned invalid vocabulary {name}"
+            )
+        if any(not _ecmascript_trim(value) for value in values):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned blank vocabulary {name}"
+            )
+        if len(set(values)) != len(values):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned duplicate vocabulary {name}"
+            )
+        if values != sorted(values, key=_ecmascript_ordinal_key):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned unordered vocabulary {name}"
+            )
+
+
+def _ecmascript_ordinal_key(value: str) -> bytes:
+    """Match JavaScript's default Array.sort() UTF-16 code-unit ordering."""
+    return value.encode("utf-16-be", "surrogatepass")
 
 
 def _matches_query_value(
