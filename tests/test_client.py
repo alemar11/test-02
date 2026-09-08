@@ -257,13 +257,13 @@ class FakeSession:
     ) -> None:
         self.response = response
         self.error = error
-        self.calls: list[tuple[str, float, dict[str, str | int] | None]] = []
+        self.calls: list[tuple[str, int | float, dict[str, str | int] | None]] = []
 
     def get(
         self,
         url: str,
         *,
-        timeout: float,
+        timeout: int | float,
         params: dict[str, str | int] | None = None,
     ) -> FakeResponse:
         self.calls.append((url, timeout, params))
@@ -334,6 +334,47 @@ class ApiClientTests(unittest.TestCase):
 
         self.assertEqual(client.health(), {"status": "ok"})
         self.assertEqual(session.calls, [("http://api.example.test/health", 5.0, None)])
+
+    def test_timeout_accepts_positive_numbers_and_preserves_the_value(self) -> None:
+        for timeout in (2, 2.5):
+            with self.subTest(timeout=timeout):
+                session = FakeSession(FakeResponse({"status": "ok"}))
+                client = ApiClient(
+                    "http://api.example.test",
+                    timeout=timeout,
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                self.assertEqual(client.health(), {"status": "ok"})
+                self.assertEqual(session.calls[0][1], timeout)
+                self.assertIs(type(session.calls[0][1]), type(timeout))
+
+    def test_timeout_rejects_invalid_values_before_transport(self) -> None:
+        invalid_timeouts = (
+            True,
+            False,
+            None,
+            "2.5",
+            0,
+            -1,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+        )
+
+        for timeout in invalid_timeouts:
+            with self.subTest(timeout=repr(timeout)):
+                session = FakeSession(FakeResponse({"status": "ok"}))
+                with self.assertRaisesRegex(
+                    ApiError,
+                    "timeout must be a finite positive number",
+                ):
+                    ApiClient(
+                        "http://api.example.test",
+                        timeout=timeout,  # type: ignore[arg-type]
+                        session=session,  # type: ignore[arg-type]
+                    )
+                self.assertEqual(session.calls, [])
 
     def test_capabilities_validates_required_semantics_and_preserves_additions(
         self,

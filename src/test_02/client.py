@@ -258,13 +258,23 @@ class ApiError(RuntimeError):
     """Raised when the API cannot return a valid response."""
 
 
+def _validate_timeout(timeout: Any) -> None:
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ApiError("timeout must be a finite positive number")
+    if isinstance(timeout, float) and not math.isfinite(timeout):
+        raise ApiError("timeout must be a finite positive number")
+    if timeout <= 0:
+        raise ApiError("timeout must be a finite positive number")
+
+
 @dataclass
 class ApiClient:
     base_url: str
-    timeout: float = 5.0
+    timeout: int | float = 5.0
     session: requests.Session | None = None
 
     def __post_init__(self) -> None:
+        _validate_timeout(self.timeout)
         self.base_url = self.base_url.rstrip("/")
         if self.session is None:
             self.session = requests.Session()

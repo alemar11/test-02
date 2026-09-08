@@ -31,7 +31,7 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        client_class.assert_called_once_with("http://api.example.test")
+        client_class.assert_called_once_with("http://api.example.test", timeout=5.0)
         client_class.return_value.capabilities.assert_called_once_with()
         self.assertEqual(
             output.getvalue(),
@@ -62,7 +62,7 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        client_class.assert_called_once_with("http://api.example.test")
+        client_class.assert_called_once_with("http://api.example.test", timeout=5.0)
         client_class.return_value.get_item.assert_called_once_with(item_id)
         self.assertEqual(
             output.getvalue(),
@@ -112,7 +112,7 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        client_class.assert_called_once_with("http://api.example.test")
+        client_class.assert_called_once_with("http://api.example.test", timeout=5.0)
         client_class.return_value.discover_items.assert_called_once_with(
             status="active",
             category="core-service",
@@ -162,7 +162,7 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        client_class.assert_called_once_with("http://api.example.test")
+        client_class.assert_called_once_with("http://api.example.test", timeout=5.0)
         client_class.return_value.item_facets.assert_called_once_with(
             status="active",
             category="core-service",
@@ -256,7 +256,7 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        client_class.assert_called_once_with("http://api.example.test")
+        client_class.assert_called_once_with("http://api.example.test", timeout=5.0)
         client_class.return_value.item_summary.assert_called_once_with(
             status="active",
             category="support-service",
@@ -309,7 +309,10 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        client_class.assert_called_once_with("http://127.0.0.1:3000")
+        client_class.assert_called_once_with(
+            "http://127.0.0.1:3000",
+            timeout=5.0,
+        )
         client_class.return_value.iter_items.assert_called_once_with(
             status="active",
             category="service,one",
@@ -457,7 +460,7 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        client_class.assert_called_once_with("http://api.example.test")
+        client_class.assert_called_once_with("http://api.example.test", timeout=5.0)
         client_class.return_value.get_items.assert_called_once_with(
             ["item-2", "missing", "item-1"]
         )
@@ -476,7 +479,56 @@ class CliTests(unittest.TestCase):
             result = main(["health"])
 
         self.assertEqual(result, 0)
+        client_class.assert_called_once_with(
+            "http://127.0.0.1:3000",
+            timeout=5.0,
+        )
         self.assertEqual(output.getvalue(), '{\n  "status": "ok"\n}\n')
+
+    @patch("test_02.cli.ApiClient")
+    def test_global_timeout_is_passed_to_every_command(self, client_class) -> None:
+        for command, method_name in (
+            ("health", "health"),
+            ("capabilities", "capabilities"),
+            ("items", "discover_items"),
+            ("facets", "item_facets"),
+            ("summary", "item_summary"),
+        ):
+            with self.subTest(command=command):
+                client_class.reset_mock()
+                getattr(client_class.return_value, method_name).return_value = {}
+                output = io.StringIO()
+
+                with redirect_stdout(output):
+                    result = main(
+                        [
+                            "--base-url",
+                            "http://api.example.test",
+                            "--timeout",
+                            "1.25",
+                            command,
+                        ]
+                    )
+
+                self.assertEqual(result, 0)
+                client_class.assert_called_once_with(
+                    "http://api.example.test",
+                    timeout=1.25,
+                )
+
+    @patch("test_02.cli.ApiClient")
+    def test_invalid_timeout_is_rejected_before_client_creation(self, client_class) -> None:
+        for timeout in ("not-a-number", "0", "-1", "nan", "inf", "-inf", "1e309"):
+            with self.subTest(timeout=timeout):
+                errors = io.StringIO()
+
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+                    main([f"--timeout={timeout}", "health"])
+
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("expected a finite positive number", errors.getvalue())
+                client_class.assert_not_called()
+                client_class.reset_mock()
 
     @patch("test_02.cli.ApiClient")
     def test_order_without_sort_is_rejected_before_client_creation(self, client_class) -> None:
