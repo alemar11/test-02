@@ -13,6 +13,7 @@ Start the API in `test-01`, then run one of these commands:
 ```bash
 uv run test-02 health
 uv run test-02 capabilities
+uv run test-02 item item-1
 uv run test-02 items
 uv run test-02 items --label featured --status active --sort name --limit 5
 uv run test-02 facets --label read-only --status active
@@ -79,6 +80,28 @@ through 100 raise `ApiError`. Transport failures, HTTP errors, invalid JSON, and
 malformed collection envelopes also have distinct `ApiError` messages.
 `list_items()` intentionally keeps the original unqueried
 `{ "data": [...] }` response compatibility and returns only the data array.
+
+## Item details
+
+The `item` command and `ApiClient.get_item()` read one exact item ID from
+`GET /api/items/{id}`:
+
+```bash
+uv run test-02 item item-1
+```
+
+```python
+from test_02.client import ApiClient
+
+client = ApiClient("http://127.0.0.1:3000")
+item = client.get_item("item-1")
+```
+
+The client validates the returned `data` object, including its exact `id`,
+string `name`, `status`, and `category`, and its list of string `labels`.
+Input IDs must be non-blank strings. IDs are percent-encoded as one URL path
+segment, so reserved characters cannot add a query or fragment. Unknown IDs
+retain the API's HTTP 404 error and the CLI's stderr-only exit status `1`.
 
 ## Capability discovery
 

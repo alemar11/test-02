@@ -2,6 +2,7 @@ import math
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -24,6 +25,7 @@ _QUERY_KEYS = {
 _FACET_ENVELOPE_KEYS = {"data", "filters"}
 _FACET_DATA_KEYS = {"total", "byLabel"}
 _FACET_FILTER_KEYS = {"status", "category", "label", "q"}
+_ITEM_DATA_KEYS = {"id", "name", "status", "category", "labels"}
 _SUMMARY_ENVELOPE_KEYS = {"data", "insights"}
 _SUMMARY_DATA_KEYS = {"total", "byStatus", "byCategory"}
 _SUMMARY_INSIGHT_KEYS = {"total", "matching", "byStatus", "filters"}
@@ -264,6 +266,17 @@ class ApiClient:
             raise ApiError("API response field 'data' must be a list")
         return data
 
+    def get_item(self, item_id: str) -> JsonObject:
+        """Return the validated item identified by one exact path-segment ID."""
+        item_id = _item_id(item_id)
+        encoded_item_id = _item_path_segment(item_id)
+        payload = self._get(
+            f"/api/items/{encoded_item_id}",
+            preserve_path_encoding=item_id in {".", ".."},
+        )
+        _validate_item_envelope(payload, item_id, encoded_item_id)
+        return payload["data"]
+
     def discover_items(
         self,
         *,
@@ -425,6 +438,7 @@ class ApiClient:
         path: str,
         *,
         params: dict[str, QueryValue] | None = None,
+        preserve_path_encoding: bool = False,
     ) -> JsonObject:
         assert self.session is not None
 
@@ -432,7 +446,19 @@ class ApiClient:
             request_options: dict[str, Any] = {"timeout": self.timeout}
             if params is not None:
                 request_options["params"] = params
-            response = self.session.get(f"{self.base_url}{path}", **request_options)
+            url = f"{self.base_url}{path}"
+            if preserve_path_encoding and isinstance(self.session, requests.Session):
+                # requests' URL preparation decodes percent-encoded unreserved
+                # characters, including the dots in %2E and %2E%2E. Prepare the
+                # request for normal session configuration, then restore the
+                # exact encoded URL before the adapter sends it.
+                prepared = self.session.prepare_request(
+                    requests.Request("GET", url, params=params)
+                )
+                prepared.url = url
+                response = self.session.send(prepared, timeout=self.timeout)
+            else:
+                response = self.session.get(url, **request_options)
         except requests.RequestException as error:
             raise ApiError(f"GET {path} transport failed: {error}") from error
 
@@ -756,6 +782,29 @@ def _filtered_query(
     return params, expected_filters, normalized_queries
 
 
+def _item_id(item_id: Any) -> str:
+    if not isinstance(item_id, str):
+        raise ApiError("invalid item id: expected a string")
+    try:
+        # Calling the base implementation rejects surrogate code points before
+        # requests encodes the path and keeps the exact ID text unchanged.
+        item_id = str.encode(item_id, "utf-8", "strict").decode("utf-8")
+    except UnicodeError as error:
+        raise ApiError("invalid item id: expected a valid Unicode string") from error
+    if not _ecmascript_trim(item_id):
+        raise ApiError("invalid item id: expected a non-blank string")
+    return item_id
+
+
+def _item_path_segment(item_id: str) -> str:
+    encoded_item_id = quote(item_id, safe="")
+    if item_id == ".":
+        return "%2E"
+    if item_id == "..":
+        return "%2E%2E"
+    return encoded_item_id
+
+
 def _canonical_query_string(
     name: str,
     value: Any,
@@ -898,6 +947,27 @@ def _validate_collection_envelope(
     expected_data_count = max(0, min(limit, total - ((page - 1) * limit)))
     if len(data) != expected_data_count:
         raise ApiError("GET /api/items returned data inconsistent with pagination metadata")
+
+
+def _validate_item_envelope(
+    payload: JsonObject,
+    expected_id: str,
+    encoded_id: str,
+) -> None:
+    path = f"GET /api/items/{encoded_id}"
+    if "data" not in payload:
+        raise ApiError(f"{path} returned an invalid item envelope")
+
+    data = payload["data"]
+    if not isinstance(data, dict) or not _ITEM_DATA_KEYS.issubset(data):
+        raise ApiError(f"{path} returned invalid item data")
+    if type(data["id"]) is not str or data["id"] != expected_id:
+        raise ApiError(f"{path} returned item data with an unexpected id")
+    if any(type(data[name]) is not str for name in ("name", "status", "category")):
+        raise ApiError(f"{path} returned invalid item data")
+    labels = data["labels"]
+    if not isinstance(labels, list) or not all(type(label) is str for label in labels):
+        raise ApiError(f"{path} returned invalid item labels")
 
 
 def _validate_facet_envelope(

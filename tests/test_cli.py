@@ -39,6 +39,37 @@ class CliTests(unittest.TestCase):
         )
 
     @patch("test_02.cli.ApiClient")
+    def test_item_prints_deterministic_data_for_an_exact_id(self, client_class) -> None:
+        item_id = "item/alpha?view=full#section"
+        item = {
+            "labels": ["featured", "read-only"],
+            "id": item_id,
+            "category": "core-service",
+            "status": "active",
+            "name": "Alpha item",
+        }
+        client_class.return_value.get_item.return_value = item
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "--base-url",
+                    "http://api.example.test",
+                    "item",
+                    item_id,
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with("http://api.example.test")
+        client_class.return_value.get_item.assert_called_once_with(item_id)
+        self.assertEqual(
+            output.getvalue(),
+            json.dumps(item, indent=2, sort_keys=True) + "\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
     def test_items_prints_the_deterministic_discovery_envelope(self, client_class) -> None:
         envelope = {
             "data": [{"labels": ["featured"], "id": "item-1"}],
@@ -501,6 +532,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(errors.getvalue(), "error: transport failed\n")
+
+    @patch("test_02.cli.ApiClient")
+    def test_item_api_errors_use_the_existing_cli_error_contract(self, client_class) -> None:
+        client_class.return_value.get_item.side_effect = ApiError(
+            "GET /api/items/missing returned HTTP 404"
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["item", "missing"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: GET /api/items/missing returned HTTP 404\n",
+        )
 
     @patch("test_02.cli.ApiClient")
     def test_capability_errors_use_the_existing_cli_error_contract(

@@ -1,5 +1,8 @@
 import copy
+import json
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 from typing import Any
 
 import requests
@@ -846,6 +849,179 @@ class ApiClientTests(unittest.TestCase):
         with self.assertRaisesRegex(ApiError, "GET /api/items transport failed"):
             next(items)
         self.assertEqual(len(session.calls), 2)
+
+    def test_get_item_validates_data_and_encodes_one_exact_path_segment(self) -> None:
+        item_id = "item/alpha?view=full#section%20"
+        item = {
+            "id": item_id,
+            "name": "Alpha item",
+            "status": "active",
+            "category": "core-service",
+            "labels": ["featured", "read-only"],
+            "providerMetadata": {"source": "fixture"},
+        }
+        session = FakeSession(
+            FakeResponse({"data": item, "metadata": {"version": 1}})
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(client.get_item(item_id), item)
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "http://api.example.test/api/items/"
+                    "item%2Falpha%3Fview%3Dfull%23section%2520",
+                    5.0,
+                    None,
+                )
+            ],
+        )
+
+    def test_get_item_preserves_dot_segments_on_real_http_transport(self) -> None:
+        received_paths: list[str] = []
+        known_item = {
+            "id": "item-1",
+            "name": "First item",
+            "status": "active",
+            "category": "core-service",
+            "labels": ["featured", "read-only"],
+        }
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                received_paths.append(self.path)
+                if self.path == "/api/items/item-1":
+                    response_body = json.dumps({"data": known_item}).encode()
+                    self.send_response(200)
+                else:
+                    response_body = json.dumps(
+                        {"error": {"code": "item_not_found"}}
+                    ).encode()
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = ApiClient(
+                f"http://127.0.0.1:{server.server_port}",
+                session=requests.Session(),
+            )
+            self.assertEqual(client.get_item("item-1"), known_item)
+
+            for item_id, encoded_id in ((".", "%2E"), ("..", "%2E%2E")):
+                with self.subTest(item_id=item_id):
+                    with self.assertRaisesRegex(
+                        ApiError,
+                        f"GET /api/items/{encoded_id} returned HTTP 404",
+                    ):
+                        client.get_item(item_id)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+        self.assertEqual(
+            received_paths,
+            ["/api/items/item-1", "/api/items/%2E", "/api/items/%2E%2E"],
+        )
+
+    def test_get_item_rejects_blank_non_string_and_invalid_unicode_ids_locally(
+        self,
+    ) -> None:
+        session = FakeSession(FakeResponse({}))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        for item_id in (None, 42, "", "\t\u2003", "\ud800"):
+            with self.subTest(item_id=repr(item_id)):
+                with self.assertRaisesRegex(ApiError, "invalid item id"):
+                    client.get_item(item_id)  # type: ignore[arg-type]
+
+        self.assertEqual(session.calls, [])
+
+    def test_get_item_rejects_malformed_or_mismatched_data(self) -> None:
+        valid_item = {
+            "id": "item-1",
+            "name": "First item",
+            "status": "active",
+            "category": "core-service",
+            "labels": ["featured"],
+        }
+        invalid_payloads: list[dict[str, Any]] = [
+            {},
+            {"data": None},
+            {"data": []},
+        ]
+
+        for field in ("id", "name", "status", "category", "labels"):
+            payload = {"data": copy.deepcopy(valid_item)}
+            del payload["data"][field]
+            invalid_payloads.append(payload)
+
+        wrong_id = {"data": copy.deepcopy(valid_item)}
+        wrong_id["data"]["id"] = "item-2"
+        invalid_payloads.append(wrong_id)
+
+        for field in ("name", "status", "category"):
+            invalid_value = {"data": copy.deepcopy(valid_item)}
+            invalid_value["data"][field] = 1
+            invalid_payloads.append(invalid_value)
+
+        invalid_labels = {"data": copy.deepcopy(valid_item)}
+        invalid_labels["data"]["labels"] = ["featured", 1]
+        invalid_payloads.append(invalid_labels)
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                session = FakeSession(FakeResponse(payload))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(
+                    ApiError,
+                    "GET /api/items/item-1 returned",
+                ):
+                    client.get_item("item-1")
+
+    def test_get_item_preserves_transport_http_json_and_shape_errors(self) -> None:
+        cases = (
+            (
+                FakeSession(error=requests.ConnectionError("offline")),
+                "GET /api/items/item-1 transport failed",
+            ),
+            (
+                FakeSession(FakeResponse({}, status_code=404)),
+                "GET /api/items/item-1 returned HTTP 404",
+            ),
+            (
+                FakeSession(FakeResponse({}, json_error=ValueError("bad json"))),
+                "GET /api/items/item-1 returned invalid JSON",
+            ),
+            (
+                FakeSession(FakeResponse([])),
+                "GET /api/items/item-1 returned a non-object JSON payload",
+            ),
+        )
+
+        for session, message in cases:
+            with self.subTest(message=message):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, message):
+                    client.get_item("item-1")
 
     def test_discover_items_transports_all_supported_query_controls(self) -> None:
         expected_query = {
