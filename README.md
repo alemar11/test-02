@@ -13,6 +13,7 @@ Start the API in `test-01`, then run one of these commands:
 ```bash
 uv run test-02 health
 uv run test-02 capabilities
+uv run test-02 item item-1
 uv run test-02 items
 uv run test-02 items --label featured --status active --sort name --limit 5
 uv run test-02 batch item-2 missing item-1
@@ -81,6 +82,28 @@ through 100 raise `ApiError`. Transport failures, HTTP errors, invalid JSON, and
 malformed collection envelopes also have distinct `ApiError` messages.
 `list_items()` intentionally keeps the original unqueried
 `{ "data": [...] }` response compatibility and returns only the data array.
+
+## Item details
+
+The `item` command and `ApiClient.get_item()` read one exact item ID from
+`GET /api/items/{id}`:
+
+```bash
+uv run test-02 item item-1
+```
+
+```python
+from test_02.client import ApiClient
+
+client = ApiClient("http://127.0.0.1:3000")
+item = client.get_item("item-1")
+```
+
+The client validates the returned `data` object, including its exact `id`,
+string `name`, `status`, and `category`, and its list of string `labels`.
+Input IDs must be non-blank strings. IDs are percent-encoded as one URL path
+segment, so reserved characters cannot add a query or fragment. Unknown IDs
+retain the API's HTTP 404 error and the CLI's stderr-only exit status `1`.
 
 ## Capability discovery
 
@@ -235,6 +258,51 @@ top-level-shape, and summary-shape errors remain distinct `ApiError` failures.
 The client consumes these aggregates directly and never recounts downloaded
 items.
 
+## Complete item iteration
+
+`ApiClient.iter_items()` lazily yields every item in the matching catalog result:
+
+```python
+for item in client.iter_items(
+    status="active",
+    sort="name",
+    page_size=100,
+    max_pages=1000,
+):
+    print(item["id"], item["name"])
+```
+
+The iterator accepts the same status, category, label, query, sort, and order
+filters as `discover_items()`. `page_size` must be an integer from 1 through
+100 and defaults to 100. `max_pages` must be positive and defaults to 1000.
+No request is made until the iterator is advanced. It requests page 1 first,
+including for an empty result, then fetches one subsequent page at a time.
+
+Each page is validated with `discover_items()` before any item from that page
+is yielded. The iterator also requires the reported total and page count to
+remain stable and every item ID to be a non-blank unique string across the
+whole iteration. If a later page fails validation or transport, earlier items
+may already have been yielded; callers that need all-or-nothing output should
+buffer the iterator before writing results.
+
+## CSV export
+
+The `export` command writes the complete matching catalog to standard output:
+
+```bash
+uv run test-02 export --sort name --order asc --page-size 100 --max-pages 1000
+```
+
+It supports the same status, category, label, query, sort, and order filters as
+`items`, plus `--page-size` (1 through 100, default 100) and `--max-pages`
+(positive integer, default 1000). The CSV columns are `id`, `name`, `status`,
+`category`, and `labels`; labels is a compact JSON array in the provider's
+order. Standard-library CSV quoting preserves commas, quotes, and newlines in
+source values. The complete iterator is consumed before the header or any row
+is written, so a later-page or malformed-record failure leaves stdout empty and
+uses the existing `error: ...` stderr response. Empty results write the header
+only.
+
 ## Facet insights
 
 The `facets` command and `ApiClient.item_facets()` request server-owned label
@@ -254,6 +322,10 @@ prints sorted-key JSON with the complete facet envelope:
 ```json
 {
   "data": {
+    "byCategory": {
+      "core-service": 1,
+      "support-service": 1
+    },
     "byLabel": {
       "featured": 1,
       "read-only": 2,
@@ -271,11 +343,17 @@ prints sorted-key JSON with the complete facet envelope:
 ```
 
 Each matching item contributes to every label it carries, so the sum of label
-counts can be greater than `data.total`. A query with no matches returns
-`total: 0` and an empty `byLabel` object. Blank or non-string client filters
-fail locally before a request. Transport, HTTP, invalid-JSON, top-level shape,
-facet-data, and normalized-filter mismatches remain distinct `ApiError`
-failures and use the CLI's established `error: ...` stderr contract.
+counts can be greater than `data.total`. The provider may also include
+`byCategory`; when present, it contains non-blank category names with strictly
+positive integer counts whose sum is exactly `data.total`. A category-filtered
+result with matches contains exactly the requested category and its total.
+Legacy label-only responses without `byCategory` remain valid, and unknown
+additive fields are preserved in the returned envelope and CLI output. A query
+with no matches returns `total: 0` and empty `byLabel` and `byCategory` objects
+when the provider supplies both. Blank or non-string client filters fail
+locally before a request. Transport, HTTP, invalid-JSON, top-level shape,
+facet-data, and normalized-filter mismatches remain distinct `ApiError` failures
+and use the CLI's established `error: ...` stderr contract.
 
 ## Cross-repository contract
 
@@ -352,34 +430,46 @@ controls. Queried reads return exactly `data`, `pagination`, and the normalized
 eight-field `query` metadata object. This repository consumes that contract
 without sharing Git history with or modifying `test-01`.
 
-The facet tests mirror the separate provider contract from
-[provider PR #61](https://github.com/alemar11/test-01/pull/61), verified at
-candidate `77591b055d4ea68237f7b83978ebc144768fb3a5`. Its
-`GET /api/items/facets` response has exactly `data` and `filters`; `data` has
-`total` and `byLabel`; and `filters` records the exact `status`, `category`,
-and `label` values plus normalized `q`. The repositories stay independent:
-the provider candidate is contract evidence, never Git ancestry for test-02.
+The facet tests mirror the `test-01` main contract at provider commit
+[`e969a59969d7a673fff8874ab5d1160b81c5546d`](https://github.com/alemar11/test-01/commit/e969a59969d7a673fff8874ab5d1160b81c5546d).
+Its `GET /api/items/facets` response requires `data.total` and `data.byLabel`,
+and may include `data.byCategory`; the optional category map partitions the
+matching total. `filters` records the exact `status`, `category`, and `label`
+values plus normalized `q`. The repositories stay independent: the provider
+candidate is contract evidence, never Git ancestry for test-02.
 
 To reproduce the live facet contract in an isolated provider checkout:
 
 ```bash
-git clone https://github.com/alemar11/test-01.git /tmp/test-01-facet-contract
-git -C /tmp/test-01-facet-contract fetch origin pull/61/head
-git -C /tmp/test-01-facet-contract checkout --detach 77591b055d4ea68237f7b83978ebc144768fb3a5
-npm --prefix /tmp/test-01-facet-contract ci
-npm --prefix /tmp/test-01-facet-contract start
+provider_worktree=$(mktemp -d /tmp/test-01-facet-contract.XXXXXX)
+git clone https://github.com/alemar11/test-01.git "$provider_worktree"
+git -C "$provider_worktree" checkout --detach \
+  e969a59969d7a673fff8874ab5d1160b81c5546d
+test "$(git -C "$provider_worktree" rev-parse HEAD)" = \
+  e969a59969d7a673fff8874ab5d1160b81c5546d
+test -z "$(git -C "$provider_worktree" status --porcelain)"
+(cd "$provider_worktree" && npm ci)
+provider_port=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+printf 'provider_port=%s\n' "$provider_port"
+(cd "$provider_worktree" && PORT="$provider_port" npm start) &
+provider_pid=$!
+trap 'kill "$provider_pid"; wait "$provider_pid" 2>/dev/null || true' EXIT
 ```
 
-Then, from this repository in another shell, run the consumer against it:
+Then, from this repository in another shell, set `provider_port` to the port
+printed by the first shell and run the consumer against it:
 
 ```bash
-uv run test-02 --base-url http://127.0.0.1:3000 facets --status active --q " ITEM "
+uv run test-02 --base-url "http://127.0.0.1:$provider_port" facets --status active --q " ITEM "
 ```
 
-The command must produce the deterministic envelope shown above. The unit
-tests exercise the same exact response keys, filter normalization, empty-map,
-multi-label, unsupported-control, and error contracts without contacting or
-changing test-01.
+The command must produce the deterministic envelope shown above, including
+`byCategory`. After stopping the server, repeat the provider SHA and
+cleanliness checks to confirm that verification did not change provider state.
+The unit tests exercise the same exact response keys, optional category map,
+legacy label-only response, filter normalization, empty-map, multi-label,
+unsupported-control, and error contracts without contacting or changing
+`test-01`.
 
 Run the tests and syntax check with:
 
