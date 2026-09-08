@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import unittest
@@ -35,6 +36,37 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue(),
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
+    def test_item_prints_deterministic_data_for_an_exact_id(self, client_class) -> None:
+        item_id = "item/alpha?view=full#section"
+        item = {
+            "labels": ["featured", "read-only"],
+            "id": item_id,
+            "category": "core-service",
+            "status": "active",
+            "name": "Alpha item",
+        }
+        client_class.return_value.get_item.return_value = item
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "--base-url",
+                    "http://api.example.test",
+                    "item",
+                    item_id,
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with("http://api.example.test", timeout=5.0)
+        client_class.return_value.get_item.assert_called_once_with(item_id)
+        self.assertEqual(
+            output.getvalue(),
+            json.dumps(item, indent=2, sort_keys=True) + "\n",
         )
 
     @patch("test_02.cli.ApiClient")
@@ -99,6 +131,7 @@ class CliTests(unittest.TestCase):
             "data": {
                 "total": 2,
                 "byLabel": {"support": 1, "read-only": 2, "featured": 1},
+                "byCategory": {"core-service": 1, "support-service": 1},
             },
             "filters": {
                 "status": "active",
@@ -106,6 +139,7 @@ class CliTests(unittest.TestCase):
                 "label": "featured",
                 "q": "item",
             },
+            "provider": {"version": 1},
         }
         client_class.return_value.item_facets.return_value = envelope
         output = io.StringIO()
@@ -233,6 +267,208 @@ class CliTests(unittest.TestCase):
             output.getvalue(),
             json.dumps(envelope, indent=2, sort_keys=True) + "\n",
         )
+
+    @patch("test_02.cli.ApiClient")
+    def test_export_prints_quoted_rows_and_delegates_iterator_options(
+        self,
+        client_class,
+    ) -> None:
+        items = [
+            {
+                "id": "item,1",
+                "name": 'Name "quoted"\nnext',
+                "status": "active",
+                "category": "service,one",
+                "labels": ["featured", "read-only"],
+            }
+        ]
+        client_class.return_value.iter_items.return_value = items
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "export",
+                    "--status",
+                    "active",
+                    "--category",
+                    "service,one",
+                    "--label",
+                    "featured",
+                    "--q",
+                    " SECOND ",
+                    "--sort",
+                    "name",
+                    "--order",
+                    "desc",
+                    "--page-size",
+                    "1",
+                    "--max-pages",
+                    "10",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with(
+            "http://127.0.0.1:3000",
+            timeout=5.0,
+        )
+        client_class.return_value.iter_items.assert_called_once_with(
+            status="active",
+            category="service,one",
+            label="featured",
+            q=" SECOND ",
+            sort="name",
+            order="desc",
+            page_size=1,
+            max_pages=10,
+        )
+        self.assertNotIn("\r\n", output.getvalue())
+        self.assertEqual(
+            list(csv.reader(io.StringIO(output.getvalue()))),
+            [
+                ["id", "name", "status", "category", "labels"],
+                [
+                    "item,1",
+                    'Name "quoted"\nnext',
+                    "active",
+                    "service,one",
+                    '["featured","read-only"]',
+                ],
+            ],
+        )
+
+    @patch("test_02.cli.ApiClient")
+    def test_export_emits_header_only_for_empty_results(self, client_class) -> None:
+        client_class.return_value.iter_items.return_value = []
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(["export"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "id,name,status,category,labels\n")
+        client_class.return_value.iter_items.assert_called_once_with(
+            status=None,
+            category=None,
+            label=None,
+            q=None,
+            sort=None,
+            order=None,
+            page_size=100,
+            max_pages=1000,
+        )
+
+    @patch("test_02.cli.ApiClient")
+    def test_export_buffers_later_page_failures_before_writing_stdout(
+        self,
+        client_class,
+    ) -> None:
+        def failing_items():
+            yield {
+                "id": "item-1",
+                "name": "First item",
+                "status": "active",
+                "category": "core-service",
+                "labels": [],
+            }
+            raise ApiError("GET /api/items transport failed")
+
+        client_class.return_value.iter_items.return_value = failing_items()
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["export"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "error: GET /api/items transport failed\n")
+
+    @patch("test_02.cli.ApiClient")
+    def test_export_rejects_malformed_later_records_before_writing_stdout(
+        self,
+        client_class,
+    ) -> None:
+        client_class.return_value.iter_items.return_value = [
+            {
+                "id": "item-1",
+                "name": "First item",
+                "status": "active",
+                "category": "core-service",
+                "labels": [],
+            },
+            {"id": "item-2"},
+        ]
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["export"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: export item field 'name' must be a string\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
+    def test_export_rejects_invalid_bounds_and_order_before_client_creation(
+        self,
+        client_class,
+    ) -> None:
+        for arguments, expected_error in (
+            (("--page-size", "101"), "expected an integer from 1 to 100"),
+            (("--max-pages", "0"), "expected a positive integer"),
+            (("--order", "asc"), "--order requires --sort"),
+        ):
+            with self.subTest(arguments=arguments):
+                errors = io.StringIO()
+
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+                    main(["export", *arguments])
+
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(expected_error, errors.getvalue())
+
+        client_class.assert_not_called()
+
+
+    @patch("test_02.cli.ApiClient")
+    def test_batch_prints_ordered_found_and_missing_json(self, client_class) -> None:
+        envelope = {
+            "data": [
+                {"id": "item-2", "name": "Second item"},
+                {"id": "item-1", "name": "First item"},
+            ],
+            "missing": ["missing"],
+        }
+        client_class.return_value.get_items.return_value = envelope
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "--base-url",
+                    "http://api.example.test",
+                    "batch",
+                    "item-2",
+                    "missing",
+                    "item-1",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with("http://api.example.test", timeout=5.0)
+        client_class.return_value.get_items.assert_called_once_with(
+            ["item-2", "missing", "item-1"]
+        )
+        self.assertEqual(
+            output.getvalue(),
+            json.dumps(envelope, indent=2, sort_keys=True) + "\n",
+        )
+
 
     @patch("test_02.cli.ApiClient")
     def test_health_keeps_the_existing_command_behavior(self, client_class) -> None:
@@ -386,6 +622,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "error: transport failed\n")
 
     @patch("test_02.cli.ApiClient")
+    def test_item_api_errors_use_the_existing_cli_error_contract(self, client_class) -> None:
+        client_class.return_value.get_item.side_effect = ApiError(
+            "GET /api/items/missing returned HTTP 404"
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["item", "missing"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: GET /api/items/missing returned HTTP 404\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
     def test_capability_errors_use_the_existing_cli_error_contract(
         self,
         client_class,
@@ -441,6 +695,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             errors.getvalue(),
             "error: GET /api/items/summary returned invalid summary data\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
+    def test_batch_errors_use_the_existing_cli_error_contract(self, client_class) -> None:
+        client_class.return_value.get_items.side_effect = ApiError(
+            "GET /api/items/batch returned invalid batch data"
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["batch", "item-1"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: GET /api/items/batch returned invalid batch data\n",
         )
 
 
