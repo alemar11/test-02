@@ -1,5 +1,6 @@
 import math
 from collections.abc import Iterator
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -29,8 +30,11 @@ _ITEM_DATA_KEYS = {"id", "name", "status", "category", "labels"}
 _SUMMARY_ENVELOPE_KEYS = {"data", "insights"}
 _SUMMARY_DATA_KEYS = {"total", "byStatus", "byCategory"}
 _SUMMARY_INSIGHT_KEYS = {"total", "matching", "byStatus", "filters"}
+_BATCH_ENVELOPE_KEYS = {"data", "missing"}
 _SORT_FIELDS = {"id", "name", "status"}
 _SORT_ORDERS = {"asc", "desc"}
+MAX_BATCH_IDS = 50
+_ITEM_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 _CAPABILITY_PATH = "GET /api/capabilities"
 _SUPPORTED_CAPABILITY_SCHEMA_VERSION = 1
 _ITEM_FILTER_CAPABILITY_CONTROLS: JsonObject = {
@@ -113,6 +117,21 @@ _REQUIRED_CAPABILITIES: dict[str, JsonObject] = {
     "capability-discovery": {
         "method": "GET",
         "path": "/api/capabilities",
+    },
+}
+_OPTIONAL_CAPABILITIES: dict[str, JsonObject] = {
+    "item-batch": {
+        "method": "GET",
+        "path": "/api/items/batch",
+        "controls": {
+            "ids": {
+                "type": "string",
+                "cardinality": "single",
+                "nonBlank": True,
+                "minimum": 1,
+                "maximum": MAX_BATCH_IDS,
+            },
+        },
     },
 }
 _ECMASCRIPT_TRIM_CHARACTERS = (
@@ -276,6 +295,16 @@ class ApiClient:
         )
         _validate_item_envelope(payload, item_id, encoded_item_id)
         return payload["data"]
+
+    def get_items(self, ids: list[str]) -> JsonObject:
+        """Return found items and missing IDs for one validated batch request."""
+        requested_ids = _validate_batch_ids(ids)
+        payload = self._get(
+            "/api/items/batch",
+            params={"ids": ",".join(requested_ids)},
+        )
+        _validate_batch_envelope(payload, requested_ids)
+        return payload
 
     def discover_items(
         self,
@@ -534,6 +563,15 @@ def _validate_capability_manifest(payload: JsonObject) -> None:
             required_fields,
             location=f"capability {capability_id!r}",
         )
+
+    for capability_id, optional_fields in _OPTIONAL_CAPABILITIES.items():
+        capability = capabilities_by_id.get(capability_id)
+        if capability is not None:
+            _validate_required_capability_subset(
+                capability,
+                optional_fields,
+                location=f"capability {capability_id!r}",
+            )
 
 
 def _validate_required_capability_subset(
@@ -804,6 +842,40 @@ def _item_path_segment(item_id: str) -> str:
         return "%2E%2E"
     return encoded_item_id
 
+def _validate_batch_ids(ids: Any) -> list[str]:
+    if type(ids) is not list:
+        raise ApiError("invalid batch ids: expected a list")
+    if not 1 <= len(ids) <= MAX_BATCH_IDS:
+        raise ApiError(
+            "invalid batch ids: expected between 1 and "
+            f"{MAX_BATCH_IDS} ids"
+        )
+
+    normalized_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for index, item_id in enumerate(ids):
+        if not isinstance(item_id, str):
+            raise ApiError(
+                f"invalid batch id at index {index}: expected a string"
+            )
+        try:
+            normalized_id = str.encode(item_id, "utf-8", "strict").decode("utf-8")
+        except UnicodeError as error:
+            raise ApiError(
+                f"invalid batch id at index {index}: expected a valid Unicode string"
+            ) from error
+        if _ITEM_ID_PATTERN.fullmatch(normalized_id) is None:
+            raise ApiError(
+                f"invalid batch id at index {index}: expected only letters, "
+                "digits, underscores, or hyphens"
+            )
+        if normalized_id in seen_ids:
+            raise ApiError(f"invalid batch ids: duplicate id {normalized_id!r}")
+        seen_ids.add(normalized_id)
+        normalized_ids.append(normalized_id)
+
+    return normalized_ids
+
 
 def _canonical_query_string(
     name: str,
@@ -897,6 +969,52 @@ def _is_case_ignorable(
     if _is_cased(character, cased_additions, context_removals):
         return False
     return ("A" + character + "\u03a3").lower().endswith("\u03c2")
+
+
+def _validate_batch_envelope(
+    payload: JsonObject,
+    requested_ids: list[str],
+) -> None:
+    path = "GET /api/items/batch"
+    if set(payload) != _BATCH_ENVELOPE_KEYS:
+        raise ApiError(f"{path} returned an invalid batch envelope")
+
+    data = payload["data"]
+    missing = payload["missing"]
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise ApiError(f"{path} returned invalid batch data")
+    if not isinstance(missing, list) or not all(type(item_id) is str for item_id in missing):
+        raise ApiError(f"{path} returned invalid missing IDs")
+
+    found_ids: list[str] = []
+    for item in data:
+        item_id = item.get("id")
+        if type(item_id) is not str or _ITEM_ID_PATTERN.fullmatch(item_id) is None:
+            raise ApiError(f"{path} returned an item with an invalid ID")
+        if item_id in found_ids:
+            raise ApiError(f"{path} returned duplicate found item IDs")
+        if item_id not in requested_ids:
+            raise ApiError(f"{path} returned an item ID that was not requested")
+        found_ids.append(item_id)
+
+    missing_ids = list(missing)
+    if len(set(missing_ids)) != len(missing_ids):
+        raise ApiError(f"{path} returned duplicate missing IDs")
+    if any(item_id not in requested_ids for item_id in missing_ids):
+        raise ApiError(f"{path} returned a missing ID that was not requested")
+    if set(found_ids).intersection(missing_ids):
+        raise ApiError(f"{path} returned an ID in both partitions")
+
+    expected_found_ids = [
+        item_id for item_id in requested_ids if item_id not in missing_ids
+    ]
+    expected_missing_ids = [
+        item_id for item_id in requested_ids if item_id not in found_ids
+    ]
+    if found_ids != expected_found_ids:
+        raise ApiError(f"{path} returned found items in the wrong order or partition")
+    if missing_ids != expected_missing_ids:
+        raise ApiError(f"{path} returned missing IDs in the wrong order or partition")
 
 
 def _validate_collection_envelope(

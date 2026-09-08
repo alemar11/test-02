@@ -431,6 +431,42 @@ class CliTests(unittest.TestCase):
 
         client_class.assert_not_called()
 
+
+    @patch("test_02.cli.ApiClient")
+    def test_batch_prints_ordered_found_and_missing_json(self, client_class) -> None:
+        envelope = {
+            "data": [
+                {"id": "item-2", "name": "Second item"},
+                {"id": "item-1", "name": "First item"},
+            ],
+            "missing": ["missing"],
+        }
+        client_class.return_value.get_items.return_value = envelope
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = main(
+                [
+                    "--base-url",
+                    "http://api.example.test",
+                    "batch",
+                    "item-2",
+                    "missing",
+                    "item-1",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        client_class.assert_called_once_with("http://api.example.test")
+        client_class.return_value.get_items.assert_called_once_with(
+            ["item-2", "missing", "item-1"]
+        )
+        self.assertEqual(
+            output.getvalue(),
+            json.dumps(envelope, indent=2, sort_keys=True) + "\n",
+        )
+
+
     @patch("test_02.cli.ApiClient")
     def test_health_keeps_the_existing_command_behavior(self, client_class) -> None:
         client_class.return_value.health.return_value = {"status": "ok"}
@@ -607,6 +643,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             errors.getvalue(),
             "error: GET /api/items/summary returned invalid summary data\n",
+        )
+
+    @patch("test_02.cli.ApiClient")
+    def test_batch_errors_use_the_existing_cli_error_contract(self, client_class) -> None:
+        client_class.return_value.get_items.side_effect = ApiError(
+            "GET /api/items/batch returned invalid batch data"
+        )
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = main(["batch", "item-1"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(
+            errors.getvalue(),
+            "error: GET /api/items/batch returned invalid batch data\n",
         )
 
 
