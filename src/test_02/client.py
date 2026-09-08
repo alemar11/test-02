@@ -906,14 +906,14 @@ def _validate_facet_envelope(
     normalized_queries: frozenset[str] | None,
 ) -> None:
     path = "GET /api/items/facets"
-    if set(payload) != _FACET_ENVELOPE_KEYS:
+    if not _FACET_ENVELOPE_KEYS.issubset(payload):
         raise ApiError(f"{path} returned an invalid facet envelope")
 
     data = payload["data"]
     filters = payload["filters"]
-    if not isinstance(data, dict) or set(data) != _FACET_DATA_KEYS:
+    if not isinstance(data, dict) or not _FACET_DATA_KEYS.issubset(data):
         raise ApiError(f"{path} returned invalid facet data")
-    if not isinstance(filters, dict) or set(filters) != _FACET_FILTER_KEYS:
+    if not isinstance(filters, dict) or not _FACET_FILTER_KEYS.issubset(filters):
         raise ApiError(f"{path} returned invalid filter metadata")
 
     total = data["total"]
@@ -930,6 +930,27 @@ def _validate_facet_envelope(
     counts = tuple(by_label.values())
     if any(count > total for count in counts) or sum(counts) < total:
         raise ApiError(f"{path} returned label counts inconsistent with the total")
+
+    if "byCategory" in data:
+        by_category = data["byCategory"]
+        if not isinstance(by_category, dict) or not all(
+            type(name) is str
+            and bool(_ecmascript_trim(name))
+            and type(count) is int
+            and count > 0
+            for name, count in by_category.items()
+        ):
+            raise ApiError(f"{path} returned invalid category counts")
+        if sum(by_category.values()) != total:
+            raise ApiError(f"{path} returned category counts inconsistent with the total")
+
+        requested_category = expected_filters["category"]
+        if (
+            requested_category is not None
+            and total > 0
+            and by_category != {requested_category: total}
+        ):
+            raise ApiError(f"{path} returned category counts inconsistent with the request")
 
     requested_label = expected_filters["label"]
     if (

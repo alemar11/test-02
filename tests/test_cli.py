@@ -100,6 +100,7 @@ class CliTests(unittest.TestCase):
             "data": {
                 "total": 2,
                 "byLabel": {"support": 1, "read-only": 2, "featured": 1},
+                "byCategory": {"core-service": 1, "support-service": 1},
             },
             "filters": {
                 "status": "active",
@@ -107,6 +108,7 @@ class CliTests(unittest.TestCase):
                 "label": "featured",
                 "q": "item",
             },
+            "provider": {"version": 1},
         }
         client_class.return_value.item_facets.return_value = envelope
         output = io.StringIO()
