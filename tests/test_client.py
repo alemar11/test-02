@@ -245,6 +245,47 @@ class FakeSession:
         return self.response
 
 
+class QueuedSession:
+    def __init__(self, responses: list[FakeResponse | BaseException]) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, float, dict[str, str | int] | None]] = []
+
+    def get(
+        self,
+        url: str,
+        *,
+        timeout: float,
+        params: dict[str, str | int] | None = None,
+    ) -> FakeResponse:
+        self.calls.append((url, timeout, params))
+        if not self.responses:
+            raise AssertionError("unexpected request")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+def paged_collection_envelope(
+    *,
+    page: int,
+    limit: int,
+    total: int,
+    total_pages: int,
+    data: list[dict[str, Any]],
+    query: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    response = collection_envelope(data=data, query=copy.deepcopy(query))
+    response["pagination"] = {
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "totalPages": total_pages,
+    }
+    response["query"].update(page=page, limit=limit)
+    return response
+
+
 class QueryString(str):
     pass
 
@@ -526,6 +567,285 @@ class ApiClientTests(unittest.TestCase):
             session.calls,
             [("http://api.example.test/api/items", 5.0, None)],
         )
+
+    def test_iter_items_is_lazy_and_fetches_validated_pages_in_order(self) -> None:
+        query = {
+            "status": "active",
+            "category": "core-service",
+            "label": "featured",
+            "q": "first",
+            "sort": "name",
+            "order": "desc",
+            "page": 1,
+            "limit": 1,
+        }
+        session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1", "name": "First item"}],
+                        query=query,
+                    )
+                ),
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=2,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-2", "name": "Second item"}],
+                        query=query,
+                    )
+                ),
+            ]
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        items = client.iter_items(
+            status="active",
+            category="core-service",
+            label="featured",
+            q=" FIRST ",
+            sort="name",
+            order="desc",
+            page_size=1,
+            max_pages=5,
+        )
+        self.assertEqual(session.calls, [])
+        self.assertEqual(next(items), {"id": "item-1", "name": "First item"})
+        self.assertEqual(next(items), {"id": "item-2", "name": "Second item"})
+        with self.assertRaises(StopIteration):
+            next(items)
+
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "http://api.example.test/api/items",
+                    5.0,
+                    {
+                        "status": "active",
+                        "category": "core-service",
+                        "label": "featured",
+                        "q": " FIRST ",
+                        "sort": "name",
+                        "order": "desc",
+                        "page": 1,
+                        "limit": 1,
+                    },
+                ),
+                (
+                    "http://api.example.test/api/items",
+                    5.0,
+                    {
+                        "status": "active",
+                        "category": "core-service",
+                        "label": "featured",
+                        "q": " FIRST ",
+                        "sort": "name",
+                        "order": "desc",
+                        "page": 2,
+                        "limit": 1,
+                    },
+                ),
+            ],
+        )
+
+    def test_iter_items_requests_once_for_empty_results(self) -> None:
+        session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=2,
+                        total=0,
+                        total_pages=0,
+                        data=[],
+                    )
+                )
+            ]
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(list(client.iter_items(page_size=2)), [])
+        self.assertEqual(
+            session.calls,
+            [("http://api.example.test/api/items", 5.0, {"page": 1, "limit": 2})],
+        )
+
+    def test_iter_items_rejects_reported_page_budget_before_yielding(self) -> None:
+        session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                )
+            ]
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+        items = client.iter_items(page_size=1, max_pages=1)
+
+        with self.assertRaisesRegex(ApiError, "exceeding max_pages 1"):
+            next(items)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_iter_items_validates_bounds_and_existing_options_before_http(self) -> None:
+        invalid_options = (
+            {"page_size": 0},
+            {"page_size": 101},
+            {"page_size": True},
+            {"max_pages": 0},
+            {"max_pages": -1},
+            {"max_pages": True},
+            {"sort": "created"},
+            {"order": "asc"},
+            {"label": "  "},
+        )
+
+        for options in invalid_options:
+            with self.subTest(options=options):
+                session = QueuedSession([])
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+                items = client.iter_items(**options)  # type: ignore[arg-type]
+
+                with self.assertRaisesRegex(ApiError, "invalid"):
+                    next(items)
+                self.assertEqual(session.calls, [])
+
+    def test_iter_items_rejects_ids_before_yielding_a_bad_page(self) -> None:
+        invalid_data = [
+            [{"id": ""}, {"id": "item-2"}],
+            [{"id": "item-1"}, {"id": "item-1"}],
+            [{"id": "item-1"}, {"id": 2}],
+        ]
+
+        for data in invalid_data:
+            with self.subTest(data=data):
+                session = QueuedSession(
+                    [
+                        FakeResponse(
+                            paged_collection_envelope(
+                                page=1,
+                                limit=2,
+                                total=2,
+                                total_pages=1,
+                                data=data,
+                            )
+                        )
+                    ]
+                )
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "item id"):
+                    next(client.iter_items(page_size=2))
+                self.assertEqual(len(session.calls), 1)
+
+    def test_iter_items_rejects_cross_page_drift_and_duplicates_before_new_yields(
+        self,
+    ) -> None:
+        drift_session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                ),
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=2,
+                        limit=1,
+                        total=3,
+                        total_pages=3,
+                        data=[{"id": "item-2"}],
+                    )
+                ),
+            ]
+        )
+        drift_client = ApiClient(
+            "http://api.example.test",
+            session=drift_session,  # type: ignore[arg-type]
+        )
+        drift_items = drift_client.iter_items(page_size=1)
+        self.assertEqual(next(drift_items), {"id": "item-1"})
+        with self.assertRaisesRegex(ApiError, "totals that changed"):
+            next(drift_items)
+        self.assertEqual(len(drift_session.calls), 2)
+
+        duplicate_session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                ),
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=2,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                ),
+            ]
+        )
+        duplicate_client = ApiClient(
+            "http://api.example.test",
+            session=duplicate_session,  # type: ignore[arg-type]
+        )
+        duplicate_items = duplicate_client.iter_items(page_size=1)
+        self.assertEqual(next(duplicate_items), {"id": "item-1"})
+        with self.assertRaisesRegex(ApiError, "duplicate item id"):
+            next(duplicate_items)
+        self.assertEqual(len(duplicate_session.calls), 2)
+
+    def test_iter_items_propagates_later_transport_failures_without_extra_fetches(
+        self,
+    ) -> None:
+        session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                ),
+                requests.ConnectionError("offline"),
+            ]
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+        items = client.iter_items(page_size=1)
+
+        self.assertEqual(next(items), {"id": "item-1"})
+        with self.assertRaisesRegex(ApiError, "GET /api/items transport failed"):
+            next(items)
+        self.assertEqual(len(session.calls), 2)
 
     def test_discover_items_transports_all_supported_query_controls(self) -> None:
         expected_query = {
