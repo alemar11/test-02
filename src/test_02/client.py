@@ -1,4 +1,5 @@
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -340,6 +341,97 @@ class ApiClient:
         payload = self._get("/api/items/summary", params=params)
         _validate_summary_envelope(payload, expected_filters, normalized_queries)
         return payload
+
+    def iter_items(
+        self,
+        *,
+        status: str | None = None,
+        category: str | None = None,
+        label: str | None = None,
+        q: str | None = None,
+        sort: str | None = None,
+        order: str | None = None,
+        page_size: int = 100,
+        max_pages: int = 1000,
+    ) -> Iterator[JsonObject]:
+        """Lazily yield every item from the matching catalog pages.
+
+        Each page is validated before any of its items are yielded. An
+        ``ApiError`` from a later page can therefore occur after earlier items
+        have already been yielded.
+        """
+        if type(page_size) is not int or not 1 <= page_size <= 100:
+            raise ApiError(
+                "invalid iteration option 'page_size': "
+                "expected an integer from 1 to 100"
+            )
+        if type(max_pages) is not int or max_pages < 1:
+            raise ApiError(
+                "invalid iteration option 'max_pages': "
+                "expected a positive integer"
+            )
+
+        first_page = self.discover_items(
+            status=status,
+            category=category,
+            label=label,
+            q=q,
+            sort=sort,
+            order=order,
+            page=1,
+            limit=page_size,
+        )
+        first_pagination = first_page["pagination"]
+        expected_total = first_pagination["total"]
+        expected_total_pages = first_pagination["totalPages"]
+        if expected_total_pages > max_pages:
+            raise ApiError(
+                "GET /api/items reported "
+                f"{expected_total_pages} pages, exceeding max_pages {max_pages}"
+            )
+
+        seen_ids: set[str] = set()
+        page = first_page
+        for page_number in range(1, expected_total_pages + 1):
+            if page_number > 1:
+                page = self.discover_items(
+                    status=status,
+                    category=category,
+                    label=label,
+                    q=q,
+                    sort=sort,
+                    order=order,
+                    page=page_number,
+                    limit=page_size,
+                )
+
+                pagination = page["pagination"]
+                if (
+                    pagination["total"] != expected_total
+                    or pagination["totalPages"] != expected_total_pages
+                ):
+                    raise ApiError(
+                        "GET /api/items returned pagination totals that changed "
+                        "during iteration"
+                    )
+
+            page_items = page["data"]
+            page_ids: set[str] = set()
+            for item in page_items:
+                item_id = item.get("id")
+                if type(item_id) is not str or not _ecmascript_trim(item_id):
+                    raise ApiError(
+                        "GET /api/items returned an item with an invalid item id; "
+                        "expected a non-blank string"
+                    )
+                if item_id in page_ids or item_id in seen_ids:
+                    raise ApiError(
+                        f"GET /api/items returned duplicate item id {item_id!r}"
+                    )
+                page_ids.add(item_id)
+
+            seen_ids.update(page_ids)
+            yield from page_items
 
     def _get(
         self,
@@ -884,14 +976,14 @@ def _validate_facet_envelope(
     normalized_queries: frozenset[str] | None,
 ) -> None:
     path = "GET /api/items/facets"
-    if set(payload) != _FACET_ENVELOPE_KEYS:
+    if not _FACET_ENVELOPE_KEYS.issubset(payload):
         raise ApiError(f"{path} returned an invalid facet envelope")
 
     data = payload["data"]
     filters = payload["filters"]
-    if not isinstance(data, dict) or set(data) != _FACET_DATA_KEYS:
+    if not isinstance(data, dict) or not _FACET_DATA_KEYS.issubset(data):
         raise ApiError(f"{path} returned invalid facet data")
-    if not isinstance(filters, dict) or set(filters) != _FACET_FILTER_KEYS:
+    if not isinstance(filters, dict) or not _FACET_FILTER_KEYS.issubset(filters):
         raise ApiError(f"{path} returned invalid filter metadata")
 
     total = data["total"]
@@ -908,6 +1000,27 @@ def _validate_facet_envelope(
     counts = tuple(by_label.values())
     if any(count > total for count in counts) or sum(counts) < total:
         raise ApiError(f"{path} returned label counts inconsistent with the total")
+
+    if "byCategory" in data:
+        by_category = data["byCategory"]
+        if not isinstance(by_category, dict) or not all(
+            type(name) is str
+            and bool(_ecmascript_trim(name))
+            and type(count) is int
+            and count > 0
+            for name, count in by_category.items()
+        ):
+            raise ApiError(f"{path} returned invalid category counts")
+        if sum(by_category.values()) != total:
+            raise ApiError(f"{path} returned category counts inconsistent with the total")
+
+        requested_category = expected_filters["category"]
+        if (
+            requested_category is not None
+            and total > 0
+            and by_category != {requested_category: total}
+        ):
+            raise ApiError(f"{path} returned category counts inconsistent with the request")
 
     requested_label = expected_filters["label"]
     if (
