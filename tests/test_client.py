@@ -429,7 +429,13 @@ class ApiClientTests(unittest.TestCase):
     def test_capabilities_accepts_additive_reordered_supported_values(self) -> None:
         manifest = capability_manifest()
         controls = capability_entry(manifest, "item-collection")["controls"]
-        controls["sort"]["values"] = ["future-sort", "status", "id", "name"]
+        controls["sort"]["values"] = [
+            "future-sort",
+            "status",
+            "id",
+            "name",
+            "category",
+        ]
         controls["order"]["values"] = ["desc", "future-order", "asc"]
         client = ApiClient(
             "http://api.example.test",
@@ -1398,6 +1404,62 @@ class ApiClientTests(unittest.TestCase):
                         "label": "featured",
                         "q": "\ufeff FIRST \ufeff",
                         "sort": "name",
+                        "order": "desc",
+                        "page": 1,
+                        "limit": 1,
+                    },
+                )
+            ],
+        )
+
+    def test_discover_items_accepts_category_sort_and_validates_metadata(self) -> None:
+        expected_query = {
+            "status": "active",
+            "category": None,
+            "label": None,
+            "q": "item",
+            "sort": "category",
+            "order": "desc",
+            "page": 1,
+            "limit": 1,
+        }
+        response = collection_envelope(
+            data=[
+                {
+                    "id": "item-2",
+                    "name": "Second item",
+                    "status": "active",
+                    "category": "support-service",
+                    "labels": ["read-only", "support"],
+                }
+            ],
+            query=expected_query,
+        )
+        response["pagination"].update(limit=1, total=2, totalPages=2)
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            client.discover_items(
+                status="active",
+                q=" ITEM ",
+                sort="category",
+                order="desc",
+                page=1,
+                limit=1,
+            ),
+            response,
+        )
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "http://api.example.test/api/items",
+                    5.0,
+                    {
+                        "status": "active",
+                        "q": " ITEM ",
+                        "sort": "category",
                         "order": "desc",
                         "page": 1,
                         "limit": 1,

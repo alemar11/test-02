@@ -29,8 +29,9 @@ client at another local API instance and set a finite, positive request timeout
 in seconds. The default timeout is `5.0`; invalid timeout values are rejected
 by the argument parser before the client or network is used. The `items`
 command supports `--status`, `--category`, `--label`, `--q`, `--sort`,
-`--order`, `--page`, and `--limit`. It prints deterministic, sorted-key JSON
-with the complete discovery envelope:
+`--order`, `--page`, and `--limit`. Supported sort values are `id`, `name`,
+`status`, and, when advertised by the provider, `category`. It prints
+deterministic, sorted-key JSON with the complete discovery envelope:
 
 ```json
 {
@@ -88,6 +89,8 @@ through 100 raise `ApiError`. Transport failures, HTTP errors, invalid JSON, and
 malformed collection envelopes also have distinct `ApiError` messages.
 `list_items()` intentionally keeps the original unqueried
 `{ "data": [...] }` response compatibility and returns only the data array.
+Category sorting uses the provider's ordinal comparison, defaults to ascending
+order, and uses ascending item ID as the tie-breaker in either direction.
 
 ## Item details
 
@@ -464,6 +467,35 @@ candidate `73d294e027f99e0017d971410dd05c5f67561e55`. That provider accepts scal
 controls. Queried reads return exactly `data`, `pagination`, and the normalized
 eight-field `query` metadata object. This repository consumes that contract
 without sharing Git history with or modifying `test-01`.
+
+Category sorting is tested against the provider candidate at commit
+[`71851f2d600fb4b14c42329a7ff15ac113445c72`](https://github.com/alemar11/test-01/commit/71851f2d600fb4b14c42329a7ff15ac113445c72).
+The provider advertises `category` as an additive collection sort value while
+retaining the existing `id`, `name`, and `status` values. Older capability
+manifests remain readable; the consumer enables category sorting when the
+provider advertises it.
+
+To reproduce the pinned category-sorting loopback check:
+
+```bash
+git clone https://github.com/alemar11/test-01.git /tmp/test-01-category-sort-contract
+git -C /tmp/test-01-category-sort-contract checkout --detach 71851f2d600fb4b14c42329a7ff15ac113445c72
+npm --prefix /tmp/test-01-category-sort-contract ci
+npm --prefix /tmp/test-01-category-sort-contract start
+```
+
+Then run `uv run test-02 --base-url http://127.0.0.1:3000 capabilities` and
+`uv run test-02 --base-url http://127.0.0.1:3000 items --sort category --order desc`
+from this repository. The result must preserve the full discovery envelope,
+category ordering, ID tie-breaker, filters, and pagination metadata.
+
+The facet tests mirror the separate provider contract from
+[provider PR #61](https://github.com/alemar11/test-01/pull/61), verified at
+candidate `77591b055d4ea68237f7b83978ebc144768fb3a5`. Its
+`GET /api/items/facets` response has exactly `data` and `filters`; `data` has
+`total` and `byLabel`; and `filters` records the exact `status`, `category`,
+and `label` values plus normalized `q`. The repositories stay independent:
+the provider candidate is contract evidence, never Git ancestry for test-02.
 
 The facet tests mirror the `test-01` main contract at provider commit
 [`e969a59969d7a673fff8874ab5d1160b81c5546d`](https://github.com/alemar11/test-01/commit/e969a59969d7a673fff8874ab5d1160b81c5546d).
