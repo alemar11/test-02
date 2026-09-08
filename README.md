@@ -183,6 +183,51 @@ top-level-shape, and summary-shape errors remain distinct `ApiError` failures.
 The client consumes these aggregates directly and never recounts downloaded
 items.
 
+## Complete item iteration
+
+`ApiClient.iter_items()` lazily yields every item in the matching catalog result:
+
+```python
+for item in client.iter_items(
+    status="active",
+    sort="name",
+    page_size=100,
+    max_pages=1000,
+):
+    print(item["id"], item["name"])
+```
+
+The iterator accepts the same status, category, label, query, sort, and order
+filters as `discover_items()`. `page_size` must be an integer from 1 through
+100 and defaults to 100. `max_pages` must be positive and defaults to 1000.
+No request is made until the iterator is advanced. It requests page 1 first,
+including for an empty result, then fetches one subsequent page at a time.
+
+Each page is validated with `discover_items()` before any item from that page
+is yielded. The iterator also requires the reported total and page count to
+remain stable and every item ID to be a non-blank unique string across the
+whole iteration. If a later page fails validation or transport, earlier items
+may already have been yielded; callers that need all-or-nothing output should
+buffer the iterator before writing results.
+
+## CSV export
+
+The `export` command writes the complete matching catalog to standard output:
+
+```bash
+uv run test-02 export --sort name --order asc --page-size 100 --max-pages 1000
+```
+
+It supports the same status, category, label, query, sort, and order filters as
+`items`, plus `--page-size` (1 through 100, default 100) and `--max-pages`
+(positive integer, default 1000). The CSV columns are `id`, `name`, `status`,
+`category`, and `labels`; labels is a compact JSON array in the provider's
+order. Standard-library CSV quoting preserves commas, quotes, and newlines in
+source values. The complete iterator is consumed before the header or any row
+is written, so a later-page or malformed-record failure leaves stdout empty and
+uses the existing `error: ...` stderr response. Empty results write the header
+only.
+
 ## Facet insights
 
 The `facets` command and `ApiClient.item_facets()` request server-owned label
