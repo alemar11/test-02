@@ -1,10 +1,13 @@
 import copy
+import json
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 from typing import Any
 
 import requests
 
-from test_02.client import MAX_PAGE, ApiClient, ApiError
+from test_02.client import MAX_BATCH_IDS, MAX_PAGE, ApiClient, ApiError
 
 
 def collection_envelope(
@@ -34,15 +37,20 @@ def facet_envelope(
     *,
     total: int = 2,
     by_label: dict[str, int] | None = None,
+    by_category: dict[str, int] | None = None,
+    include_by_category: bool = False,
     filters: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    data = {
+        "total": total,
+        "byLabel": by_label
+        if by_label is not None
+        else {"featured": 1, "read-only": 2, "support": 1},
+    }
+    if include_by_category:
+        data["byCategory"] = by_category
     return {
-        "data": {
-            "total": total,
-            "byLabel": by_label
-            if by_label is not None
-            else {"featured": 1, "read-only": 2, "support": 1},
-        },
+        "data": data,
         "filters": filters
         if filters is not None
         else {
@@ -93,6 +101,17 @@ def summary_envelope(
                 "q": None,
             },
         },
+    }
+
+
+def batch_envelope(
+    *,
+    data: list[dict[str, Any]] | None = None,
+    missing: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "data": data if data is not None else [{"id": "item-2"}],
+        "missing": missing if missing is not None else ["missing"],
     }
 
 
@@ -194,6 +213,20 @@ def capability_manifest() -> dict[str, Any]:
                 "controls": copy.deepcopy(item_filter_controls),
             },
             {
+                "id": "item-batch",
+                "method": "GET",
+                "path": "/api/items/batch",
+                "controls": {
+                    "ids": {
+                        "type": "string",
+                        "cardinality": "single",
+                        "nonBlank": True,
+                        "minimum": 1,
+                        "maximum": 50,
+                    },
+                },
+            },
+            {
                 "id": "item-summary",
                 "method": "GET",
                 "path": "/api/items/summary",
@@ -247,6 +280,25 @@ class FakeSession:
     ) -> None:
         self.response = response
         self.error = error
+        self.calls: list[tuple[str, int | float, dict[str, str | int] | None]] = []
+
+    def get(
+        self,
+        url: str,
+        *,
+        timeout: int | float,
+        params: dict[str, str | int] | None = None,
+    ) -> FakeResponse:
+        self.calls.append((url, timeout, params))
+        if self.error is not None:
+            raise self.error
+        assert self.response is not None
+        return self.response
+
+
+class QueuedSession:
+    def __init__(self, responses: list[FakeResponse | BaseException]) -> None:
+        self.responses = list(responses)
         self.calls: list[tuple[str, float, dict[str, str | int] | None]] = []
 
     def get(
@@ -257,10 +309,32 @@ class FakeSession:
         params: dict[str, str | int] | None = None,
     ) -> FakeResponse:
         self.calls.append((url, timeout, params))
-        if self.error is not None:
-            raise self.error
-        assert self.response is not None
-        return self.response
+        if not self.responses:
+            raise AssertionError("unexpected request")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+def paged_collection_envelope(
+    *,
+    page: int,
+    limit: int,
+    total: int,
+    total_pages: int,
+    data: list[dict[str, Any]],
+    query: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    response = collection_envelope(data=data, query=copy.deepcopy(query))
+    response["pagination"] = {
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "totalPages": total_pages,
+    }
+    response["query"].update(page=page, limit=limit)
+    return response
 
 
 class QueryString(str):
@@ -283,6 +357,47 @@ class ApiClientTests(unittest.TestCase):
 
         self.assertEqual(client.health(), {"status": "ok"})
         self.assertEqual(session.calls, [("http://api.example.test/health", 5.0, None)])
+
+    def test_timeout_accepts_positive_numbers_and_preserves_the_value(self) -> None:
+        for timeout in (2, 2.5):
+            with self.subTest(timeout=timeout):
+                session = FakeSession(FakeResponse({"status": "ok"}))
+                client = ApiClient(
+                    "http://api.example.test",
+                    timeout=timeout,
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                self.assertEqual(client.health(), {"status": "ok"})
+                self.assertEqual(session.calls[0][1], timeout)
+                self.assertIs(type(session.calls[0][1]), type(timeout))
+
+    def test_timeout_rejects_invalid_values_before_transport(self) -> None:
+        invalid_timeouts = (
+            True,
+            False,
+            None,
+            "2.5",
+            0,
+            -1,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+        )
+
+        for timeout in invalid_timeouts:
+            with self.subTest(timeout=repr(timeout)):
+                session = FakeSession(FakeResponse({"status": "ok"}))
+                with self.assertRaisesRegex(
+                    ApiError,
+                    "timeout must be a finite positive number",
+                ):
+                    ApiClient(
+                        "http://api.example.test",
+                        timeout=timeout,  # type: ignore[arg-type]
+                        session=session,  # type: ignore[arg-type]
+                    )
+                self.assertEqual(session.calls, [])
 
     def test_capabilities_validates_required_semantics_and_preserves_additions(
         self,
@@ -323,6 +438,21 @@ class ApiClientTests(unittest.TestCase):
 
         self.assertIs(client.capabilities(), manifest)
 
+    def test_capabilities_keeps_legacy_manifests_compatible_without_batch(self) -> None:
+        manifest = capability_manifest()
+        manifest["capabilities"] = [
+            capability
+            for capability in manifest["capabilities"]
+            if capability["id"] != "item-batch"
+        ]
+
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        self.assertIs(client.capabilities(), manifest)
+
     def test_capabilities_accepts_and_validates_optional_vocabulary(self) -> None:
         manifest = capability_manifest()
         manifest["capabilities"].append(
@@ -340,6 +470,27 @@ class ApiClientTests(unittest.TestCase):
 
         self.assertIs(client.capabilities(), manifest)
 
+    def test_capabilities_validates_batch_when_provider_advertises_it(self) -> None:
+        manifest = capability_manifest()
+        capability_entry(manifest, "item-batch")["controls"]["ids"]["maximum"] = 49
+        client = ApiClient(
+            "http://api.example.test",
+            session=FakeSession(FakeResponse(manifest)),  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(ApiError, "capability 'item-batch'"):
+            client.capabilities()
+
+    def test_capabilities_rejects_incompatible_optional_vocabulary(self) -> None:
+        manifest = capability_manifest()
+        manifest["capabilities"].append(
+            {
+                "id": "item-vocabulary",
+                "method": "GET",
+                "path": "/api/items/vocabulary",
+                "documentation": {"stability": "stable"},
+            }
+        )
         for field, value in (("method", "POST"), ("path", "/api/vocabulary")):
             with self.subTest(field=field):
                 incompatible = copy.deepcopy(manifest)
@@ -577,6 +728,624 @@ class ApiClientTests(unittest.TestCase):
             [("http://api.example.test/api/items", 5.0, None)],
         )
 
+    def test_iter_items_is_lazy_and_fetches_validated_pages_in_order(self) -> None:
+        query = {
+            "status": "active",
+            "category": "core-service",
+            "label": "featured",
+            "q": "first",
+            "sort": "name",
+            "order": "desc",
+            "page": 1,
+            "limit": 1,
+        }
+        session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1", "name": "First item"}],
+                        query=query,
+                    )
+                ),
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=2,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-2", "name": "Second item"}],
+                        query=query,
+                    )
+                ),
+            ]
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        items = client.iter_items(
+            status="active",
+            category="core-service",
+            label="featured",
+            q=" FIRST ",
+            sort="name",
+            order="desc",
+            page_size=1,
+            max_pages=5,
+        )
+        self.assertEqual(session.calls, [])
+        self.assertEqual(next(items), {"id": "item-1", "name": "First item"})
+        self.assertEqual(next(items), {"id": "item-2", "name": "Second item"})
+        with self.assertRaises(StopIteration):
+            next(items)
+
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "http://api.example.test/api/items",
+                    5.0,
+                    {
+                        "status": "active",
+                        "category": "core-service",
+                        "label": "featured",
+                        "q": " FIRST ",
+                        "sort": "name",
+                        "order": "desc",
+                        "page": 1,
+                        "limit": 1,
+                    },
+                ),
+                (
+                    "http://api.example.test/api/items",
+                    5.0,
+                    {
+                        "status": "active",
+                        "category": "core-service",
+                        "label": "featured",
+                        "q": " FIRST ",
+                        "sort": "name",
+                        "order": "desc",
+                        "page": 2,
+                        "limit": 1,
+                    },
+                ),
+            ],
+        )
+
+    def test_iter_items_requests_once_for_empty_results(self) -> None:
+        session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=2,
+                        total=0,
+                        total_pages=0,
+                        data=[],
+                    )
+                )
+            ]
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(list(client.iter_items(page_size=2)), [])
+        self.assertEqual(
+            session.calls,
+            [("http://api.example.test/api/items", 5.0, {"page": 1, "limit": 2})],
+        )
+
+    def test_iter_items_rejects_reported_page_budget_before_yielding(self) -> None:
+        session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                )
+            ]
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+        items = client.iter_items(page_size=1, max_pages=1)
+
+        with self.assertRaisesRegex(ApiError, "exceeding max_pages 1"):
+            next(items)
+        self.assertEqual(len(session.calls), 1)
+
+    def test_iter_items_validates_bounds_and_existing_options_before_http(self) -> None:
+        invalid_options = (
+            {"page_size": 0},
+            {"page_size": 101},
+            {"page_size": True},
+            {"max_pages": 0},
+            {"max_pages": -1},
+            {"max_pages": True},
+            {"sort": "created"},
+            {"order": "asc"},
+            {"label": "  "},
+        )
+
+        for options in invalid_options:
+            with self.subTest(options=options):
+                session = QueuedSession([])
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+                items = client.iter_items(**options)  # type: ignore[arg-type]
+
+                with self.assertRaisesRegex(ApiError, "invalid"):
+                    next(items)
+                self.assertEqual(session.calls, [])
+
+    def test_iter_items_rejects_ids_before_yielding_a_bad_page(self) -> None:
+        invalid_data = [
+            [{"id": ""}, {"id": "item-2"}],
+            [{"id": "item-1"}, {"id": "item-1"}],
+            [{"id": "item-1"}, {"id": 2}],
+        ]
+
+        for data in invalid_data:
+            with self.subTest(data=data):
+                session = QueuedSession(
+                    [
+                        FakeResponse(
+                            paged_collection_envelope(
+                                page=1,
+                                limit=2,
+                                total=2,
+                                total_pages=1,
+                                data=data,
+                            )
+                        )
+                    ]
+                )
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "item id"):
+                    next(client.iter_items(page_size=2))
+                self.assertEqual(len(session.calls), 1)
+
+    def test_iter_items_rejects_cross_page_drift_and_duplicates_before_new_yields(
+        self,
+    ) -> None:
+        drift_session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                ),
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=2,
+                        limit=1,
+                        total=3,
+                        total_pages=3,
+                        data=[{"id": "item-2"}],
+                    )
+                ),
+            ]
+        )
+        drift_client = ApiClient(
+            "http://api.example.test",
+            session=drift_session,  # type: ignore[arg-type]
+        )
+        drift_items = drift_client.iter_items(page_size=1)
+        self.assertEqual(next(drift_items), {"id": "item-1"})
+        with self.assertRaisesRegex(ApiError, "totals that changed"):
+            next(drift_items)
+        self.assertEqual(len(drift_session.calls), 2)
+
+        duplicate_session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                ),
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=2,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                ),
+            ]
+        )
+        duplicate_client = ApiClient(
+            "http://api.example.test",
+            session=duplicate_session,  # type: ignore[arg-type]
+        )
+        duplicate_items = duplicate_client.iter_items(page_size=1)
+        self.assertEqual(next(duplicate_items), {"id": "item-1"})
+        with self.assertRaisesRegex(ApiError, "duplicate item id"):
+            next(duplicate_items)
+        self.assertEqual(len(duplicate_session.calls), 2)
+
+    def test_iter_items_propagates_later_transport_failures_without_extra_fetches(
+        self,
+    ) -> None:
+        session = QueuedSession(
+            [
+                FakeResponse(
+                    paged_collection_envelope(
+                        page=1,
+                        limit=1,
+                        total=2,
+                        total_pages=2,
+                        data=[{"id": "item-1"}],
+                    )
+                ),
+                requests.ConnectionError("offline"),
+            ]
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+        items = client.iter_items(page_size=1)
+
+        self.assertEqual(next(items), {"id": "item-1"})
+        with self.assertRaisesRegex(ApiError, "GET /api/items transport failed"):
+            next(items)
+        self.assertEqual(len(session.calls), 2)
+
+    def test_get_item_validates_data_and_encodes_one_exact_path_segment(self) -> None:
+        item_id = "item/alpha?view=full#section%20"
+        item = {
+            "id": item_id,
+            "name": "Alpha item",
+            "status": "active",
+            "category": "core-service",
+            "labels": ["featured", "read-only"],
+            "providerMetadata": {"source": "fixture"},
+        }
+        session = FakeSession(
+            FakeResponse({"data": item, "metadata": {"version": 1}})
+        )
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(client.get_item(item_id), item)
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "http://api.example.test/api/items/"
+                    "item%2Falpha%3Fview%3Dfull%23section%2520",
+                    5.0,
+                    None,
+                )
+            ],
+        )
+
+    def test_get_item_preserves_dot_segments_on_real_http_transport(self) -> None:
+        received_paths: list[str] = []
+        known_item = {
+            "id": "item-1",
+            "name": "First item",
+            "status": "active",
+            "category": "core-service",
+            "labels": ["featured", "read-only"],
+        }
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                received_paths.append(self.path)
+                if self.path == "/api/items/item-1":
+                    response_body = json.dumps({"data": known_item}).encode()
+                    self.send_response(200)
+                else:
+                    response_body = json.dumps(
+                        {"error": {"code": "item_not_found"}}
+                    ).encode()
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = ApiClient(
+                f"http://127.0.0.1:{server.server_port}",
+                session=requests.Session(),
+            )
+            self.assertEqual(client.get_item("item-1"), known_item)
+
+            for item_id, encoded_id in ((".", "%2E"), ("..", "%2E%2E")):
+                with self.subTest(item_id=item_id):
+                    with self.assertRaisesRegex(
+                        ApiError,
+                        f"GET /api/items/{encoded_id} returned HTTP 404",
+                    ):
+                        client.get_item(item_id)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+        self.assertEqual(
+            received_paths,
+            ["/api/items/item-1", "/api/items/%2E", "/api/items/%2E%2E"],
+        )
+
+    def test_get_item_rejects_blank_non_string_and_invalid_unicode_ids_locally(
+        self,
+    ) -> None:
+        session = FakeSession(FakeResponse({}))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        for item_id in (None, 42, "", "\t\u2003", "\ud800"):
+            with self.subTest(item_id=repr(item_id)):
+                with self.assertRaisesRegex(ApiError, "invalid item id"):
+                    client.get_item(item_id)  # type: ignore[arg-type]
+
+        self.assertEqual(session.calls, [])
+
+    def test_get_item_rejects_malformed_or_mismatched_data(self) -> None:
+        valid_item = {
+            "id": "item-1",
+            "name": "First item",
+            "status": "active",
+            "category": "core-service",
+            "labels": ["featured"],
+        }
+        invalid_payloads: list[dict[str, Any]] = [
+            {},
+            {"data": None},
+            {"data": []},
+        ]
+
+        for field in ("id", "name", "status", "category", "labels"):
+            payload = {"data": copy.deepcopy(valid_item)}
+            del payload["data"][field]
+            invalid_payloads.append(payload)
+
+        wrong_id = {"data": copy.deepcopy(valid_item)}
+        wrong_id["data"]["id"] = "item-2"
+        invalid_payloads.append(wrong_id)
+
+        for field in ("name", "status", "category"):
+            invalid_value = {"data": copy.deepcopy(valid_item)}
+            invalid_value["data"][field] = 1
+            invalid_payloads.append(invalid_value)
+
+        invalid_labels = {"data": copy.deepcopy(valid_item)}
+        invalid_labels["data"]["labels"] = ["featured", 1]
+        invalid_payloads.append(invalid_labels)
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                session = FakeSession(FakeResponse(payload))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(
+                    ApiError,
+                    "GET /api/items/item-1 returned",
+                ):
+                    client.get_item("item-1")
+
+    def test_get_item_preserves_transport_http_json_and_shape_errors(self) -> None:
+        cases = (
+            (
+                FakeSession(error=requests.ConnectionError("offline")),
+                "GET /api/items/item-1 transport failed",
+            ),
+            (
+                FakeSession(FakeResponse({}, status_code=404)),
+                "GET /api/items/item-1 returned HTTP 404",
+            ),
+            (
+                FakeSession(FakeResponse({}, json_error=ValueError("bad json"))),
+                "GET /api/items/item-1 returned invalid JSON",
+            ),
+            (
+                FakeSession(FakeResponse([])),
+                "GET /api/items/item-1 returned a non-object JSON payload",
+            ),
+        )
+
+        for session, message in cases:
+            with self.subTest(message=message):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, message):
+                    client.get_item("item-1")
+
+
+    def test_get_items_returns_ordered_found_and_missing_partitions(self) -> None:
+        response = batch_envelope(
+            data=[{"id": "item-2", "name": "Second item"}, {"id": "item-1"}],
+            missing=["missing"],
+        )
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient("http://api.example.test", session=session)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            client.get_items(["item-2", "missing", "item-1"]),
+            response,
+        )
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "http://api.example.test/api/items/batch",
+                    5.0,
+                    {"ids": "item-2,missing,item-1"},
+                )
+            ],
+        )
+
+    def test_get_items_accepts_all_known_and_all_missing_batches(self) -> None:
+        for response, ids in (
+            (
+                batch_envelope(
+                    data=[{"id": "item-1"}, {"id": "item-2"}],
+                    missing=[],
+                ),
+                ["item-1", "item-2"],
+            ),
+            (
+                batch_envelope(data=[], missing=["missing-a", "missing-b"]),
+                ["missing-a", "missing-b"],
+            ),
+        ):
+            with self.subTest(response=response):
+                session = FakeSession(FakeResponse(response))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                self.assertEqual(client.get_items(ids), response)
+
+    def test_invalid_batch_ids_fail_before_a_request(self) -> None:
+        invalid_ids: tuple[Any, ...] = (
+            None,
+            (),
+            "item-1",
+            [],
+            [""],
+            ["item 1"],
+            ["item-1", "item-1"],
+            ["item-1", 1],
+            ["item-1", "bad,id"],
+            ["item-1"] * (MAX_BATCH_IDS + 1),
+        )
+
+        for ids in invalid_ids:
+            with self.subTest(ids=ids):
+                session = FakeSession(FakeResponse(batch_envelope()))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "invalid batch"):
+                    client.get_items(ids)  # type: ignore[arg-type]
+
+                self.assertEqual(session.calls, [])
+
+    def test_get_items_rejects_malformed_or_inconsistent_partitions(self) -> None:
+        requested_ids = ["item-2", "missing", "item-1"]
+        invalid_responses = []
+
+        missing_data = batch_envelope()
+        del missing_data["data"]
+        invalid_responses.append(missing_data)
+
+        extra_field = batch_envelope()
+        extra_field["extra"] = True
+        invalid_responses.append(extra_field)
+
+        invalid_item = batch_envelope(data=[{"name": "missing id"}], missing=["item-1", "item-2"])
+        invalid_responses.append(invalid_item)
+
+        unknown_item = batch_envelope(data=[{"id": "item-3"}], missing=["missing", "item-1"])
+        invalid_responses.append(unknown_item)
+
+        duplicate_item = batch_envelope(
+            data=[{"id": "item-2"}, {"id": "item-2"}],
+            missing=["missing", "item-1"],
+        )
+        invalid_responses.append(duplicate_item)
+
+        unknown_missing = batch_envelope(
+            data=[{"id": "item-2"}, {"id": "item-1"}],
+            missing=["other"],
+        )
+        invalid_responses.append(unknown_missing)
+
+        duplicate_missing = batch_envelope(
+            data=[{"id": "item-2"}, {"id": "item-1"}],
+            missing=["missing", "missing"],
+        )
+        invalid_responses.append(duplicate_missing)
+
+        overlap = batch_envelope(data=[{"id": "item-2"}], missing=["item-2", "missing", "item-1"])
+        invalid_responses.append(overlap)
+
+        wrong_found_order = batch_envelope(
+            data=[{"id": "item-1"}, {"id": "item-2"}],
+            missing=["missing"],
+        )
+        invalid_responses.append(wrong_found_order)
+
+        wrong_missing_order = batch_envelope(
+            data=[{"id": "item-1"}],
+            missing=["missing", "item-2"],
+        )
+        invalid_responses.append(wrong_missing_order)
+
+        for response in invalid_responses:
+            with self.subTest(response=response):
+                session = FakeSession(FakeResponse(copy.deepcopy(response)))
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, "GET /api/items/batch returned"):
+                    client.get_items(requested_ids)
+
+    def test_get_items_preserves_transport_http_json_and_shape_errors(self) -> None:
+        cases = (
+            (
+                FakeSession(error=requests.ConnectionError("offline")),
+                "GET /api/items/batch transport failed",
+            ),
+            (
+                FakeSession(FakeResponse({}, status_code=422)),
+                "GET /api/items/batch returned HTTP 422",
+            ),
+            (
+                FakeSession(FakeResponse({}, json_error=ValueError("bad json"))),
+                "GET /api/items/batch returned invalid JSON",
+            ),
+            (
+                FakeSession(FakeResponse([])),
+                "GET /api/items/batch returned a non-object JSON payload",
+            ),
+        )
+
+        for session, message in cases:
+            with self.subTest(message=message):
+                client = ApiClient(
+                    "http://api.example.test",
+                    session=session,  # type: ignore[arg-type]
+                )
+
+                with self.assertRaisesRegex(ApiError, message):
+                    client.get_items(["item-1"])
+
     def test_discover_items_transports_all_supported_query_controls(self) -> None:
         expected_query = {
             "status": "active",
@@ -694,6 +1463,12 @@ class ApiClientTests(unittest.TestCase):
                 total=2,
                 by_label={"featured": 1, "read-only": 2, "support": 1},
             ),
+            facet_envelope(
+                total=2,
+                by_label={"featured": 1, "read-only": 2, "support": 1},
+                by_category={"core-service": 1, "support-service": 1},
+                include_by_category=True,
+            ),
         )
 
         for response in valid_responses:
@@ -709,6 +1484,22 @@ class ApiClientTests(unittest.TestCase):
                     session.calls,
                     [("http://api.example.test/api/items/facets", 5.0, {})],
                 )
+
+    def test_item_facets_preserves_additive_envelope_fields(self) -> None:
+        response = facet_envelope(
+            by_category={"core-service": 1, "support-service": 1},
+            include_by_category=True,
+        )
+        response["provider"] = {"version": 1}
+        response["data"]["futureAggregate"] = {"core-service": 1}
+        response["filters"]["futureFilter"] = None
+        session = FakeSession(FakeResponse(response))
+        client = ApiClient(
+            "http://api.example.test",
+            session=session,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(client.item_facets(), response)
 
     def test_item_summary_transports_supported_filters_and_validates_insights(
         self,
@@ -1194,10 +1985,6 @@ class ApiClientTests(unittest.TestCase):
         del missing_filters["filters"]
         invalid_envelopes.append(missing_filters)
 
-        extra_field = facet_envelope()
-        extra_field["unexpected"] = None
-        invalid_envelopes.append(extra_field)
-
         incomplete_data = facet_envelope()
         del incomplete_data["data"]["byLabel"]
         invalid_envelopes.append(incomplete_data)
@@ -1231,6 +2018,58 @@ class ApiClientTests(unittest.TestCase):
             by_label={"featured": 1},
         )
         invalid_envelopes.append(labels_for_zero_matches)
+
+        invalid_category_map = facet_envelope(
+            by_category=None,
+            include_by_category=True,
+        )
+        invalid_envelopes.append(invalid_category_map)
+
+        blank_category = facet_envelope(
+            by_category={" ": 2},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(blank_category)
+
+        boolean_category_count = facet_envelope(
+            by_category={"core-service": True},  # type: ignore[dict-item]
+            include_by_category=True,
+        )
+        invalid_envelopes.append(boolean_category_count)
+
+        zero_category_count = facet_envelope(
+            by_category={"core-service": 0},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(zero_category_count)
+
+        negative_category_count = facet_envelope(
+            by_category={"core-service": -1},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(negative_category_count)
+
+        category_counts_above_total = facet_envelope(
+            total=1,
+            by_label={"featured": 1},
+            by_category={"core-service": 2},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(category_counts_above_total)
+
+        category_counts_below_total = facet_envelope(
+            by_category={"core-service": 1},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(category_counts_below_total)
+
+        categories_for_zero_matches = facet_envelope(
+            total=0,
+            by_label={},
+            by_category={"core-service": 1},
+            include_by_category=True,
+        )
+        invalid_envelopes.append(categories_for_zero_matches)
 
         incomplete_filters = facet_envelope()
         del incomplete_filters["filters"]["category"]
@@ -1269,6 +2108,25 @@ class ApiClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ApiError, "inconsistent with the request"):
             client.item_facets(label="featured")
+
+        category_mismatch = facet_envelope(
+            by_category={"core-service": 1, "support-service": 1},
+            include_by_category=True,
+            filters={
+                "status": None,
+                "category": "core-service",
+                "label": None,
+                "q": None,
+            },
+        )
+        session = FakeSession(FakeResponse(category_mismatch))
+        client = ApiClient(
+            "http://api.example.test",
+            session=session,  # type: ignore[arg-type]
+        )
+
+        with self.assertRaisesRegex(ApiError, "inconsistent with the request"):
+            client.item_facets(category="core-service")
 
     def test_item_facets_preserves_transport_http_json_and_shape_errors(self) -> None:
         cases = (
