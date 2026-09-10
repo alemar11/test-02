@@ -562,3 +562,18 @@ Run the tests and syntax check with:
 uv run python -m unittest discover -s tests
 uv run python -m compileall -q src tests
 ```
+
+## Dummy-project coordination probe
+
+Run the opt-in skill-validation probe against a supplied provider base URL:
+
+```sh
+uv run test-02 --base-url http://127.0.0.1:3000 coordination-probe
+```
+
+The command sends `GET /api/coordination-probe` and prints the JSON object only
+when `protocol` is `"se-coordination-v2"` and `revision` is the integer `1`.
+It exits with status 1 and an error on stderr for an incompatible contract,
+network/HTTP failure, invalid JSON, or a non-object response. Boolean, string,
+and floating-point revisions are rejected. This dummy-project skill-validation
+command is separate from the older smoke tests and runs only when requested.

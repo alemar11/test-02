@@ -97,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("health", help="Read API health")
+    commands.add_parser("coordination-probe", help="Validate the dummy-project coordination contract")
     commands.add_parser(
         "capabilities",
         help="Discover compatible provider capabilities",
@@ -155,6 +156,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "health":
             payload = client.health()
+        elif args.command == "coordination-probe":
+            payload = client.coordination_probe()
         elif args.command == "capabilities":
             payload = client.capabilities()
         elif args.command == "vocabulary":
