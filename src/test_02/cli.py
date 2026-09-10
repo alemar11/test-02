@@ -1,5 +1,7 @@
 import argparse
+import csv
 import json
+import math
 import sys
 from collections.abc import Sequence
 
@@ -30,6 +32,56 @@ def _page(value: str) -> int:
     return parsed
 
 
+def _page_size(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 100:
+        raise argparse.ArgumentTypeError("expected an integer from 1 to 100")
+    return parsed
+
+
+def _csv_rows(
+    items: list[dict[str, object]],
+) -> list[tuple[str, str, str, str, str]]:
+    rows: list[tuple[str, str, str, str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ApiError("export item must be an object")
+        scalar_values: list[str] = []
+        for field in ("id", "name", "status", "category"):
+            value = item.get(field)
+            if type(value) is not str:
+                raise ApiError(
+                    f"export item field '{field}' must be a string"
+                )
+            scalar_values.append(value)
+
+        labels = item.get("labels")
+        if not isinstance(labels, list) or not all(
+            type(label) is str for label in labels
+        ):
+            raise ApiError("export item field 'labels' must be a list of strings")
+
+        rows.append(
+            (
+                scalar_values[0],
+                scalar_values[1],
+                scalar_values[2],
+                scalar_values[3],
+                json.dumps(labels, separators=(",", ":")),
+            )
+        )
+    return rows
+
+def _timeout(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "expected a finite positive number"
+        ) from error
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a finite positive number")
+    return parsed
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read data from test-01")
     parser.add_argument(
@@ -37,42 +89,76 @@ def build_parser() -> argparse.ArgumentParser:
         default="http://127.0.0.1:3000",
         help="Base URL of the test-01 API",
     )
+    parser.add_argument(
+        "--timeout",
+        type=_timeout,
+        default=5.0,
+        help="Request timeout in seconds (must be finite and positive)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("health", help="Read API health")
     commands.add_parser(
         "capabilities",
         help="Discover compatible provider capabilities",
     )
+    item = commands.add_parser("item", help="Read one item by exact ID")
+    item.add_argument("item_id", help="Exact item ID")
+    commands.add_parser(
+        "vocabulary",
+        help="Read available item status, category, and label values",
+    )
     items = commands.add_parser("items", help="Discover items")
     items.add_argument("--status", help="Exact status filter")
     items.add_argument("--category", help="Exact category filter")
     items.add_argument("--label", help="Exact label membership filter")
     items.add_argument("--q", help="Case-insensitive item name search")
-    items.add_argument("--sort", choices=("id", "name", "status"))
+    items.add_argument("--sort", choices=("id", "name", "status", "category"))
     items.add_argument("--order", choices=("asc", "desc"))
     items.add_argument("--page", type=_page, default=1)
     items.add_argument("--limit", type=_limit, default=20)
+    batch = commands.add_parser("batch", help="Read a bounded batch of items")
+    batch.add_argument("ids", nargs="+", metavar="ID", help="Item IDs to read")
     facets = commands.add_parser("facets", help="Read item label facets")
     facets.add_argument("--status", help="Exact status filter")
     facets.add_argument("--category", help="Exact category filter")
     facets.add_argument("--label", help="Exact label membership filter")
     facets.add_argument("--q", help="Case-insensitive item name search")
+    summary = commands.add_parser("summary", help="Read the item summary")
+    summary.add_argument("--status", help="Exact status filter")
+    summary.add_argument("--category", help="Exact category filter")
+    summary.add_argument("--label", help="Exact label membership filter")
+    summary.add_argument("--q", help="Case-insensitive item name search")
+    export = commands.add_parser("export", help="Export matching items as CSV")
+    export.add_argument("--status", help="Exact status filter")
+    export.add_argument("--category", help="Exact category filter")
+    export.add_argument("--label", help="Exact label membership filter")
+    export.add_argument("--q", help="Case-insensitive item name search")
+    export.add_argument("--sort", choices=("id", "name", "status"))
+    export.add_argument("--order", choices=("asc", "desc"))
+    export.add_argument("--page-size", type=_page_size, default=100)
+    export.add_argument("--max-pages", type=_positive_int, default=1000)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == "items" and args.order is not None and args.sort is None:
+    if (
+        args.command in {"items", "export"}
+        and args.order is not None
+        and args.sort is None
+    ):
         parser.error("--order requires --sort")
 
-    client = ApiClient(args.base_url)
+    client = ApiClient(args.base_url, timeout=args.timeout)
 
     try:
         if args.command == "health":
             payload = client.health()
         elif args.command == "capabilities":
             payload = client.capabilities()
+        elif args.command == "vocabulary":
+            payload = client.item_vocabulary()
         elif args.command == "items":
             payload = client.discover_items(
                 status=args.status,
@@ -84,8 +170,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 page=args.page,
                 limit=args.limit,
             )
-        else:
+        elif args.command == "item":
+            payload = client.get_item(args.item_id)
+        elif args.command == "batch":
+            payload = client.get_items(args.ids)
+        elif args.command == "facets":
             payload = client.item_facets(
+                status=args.status,
+                category=args.category,
+                label=args.label,
+                q=args.q,
+            )
+        elif args.command == "export":
+            items = list(
+                client.iter_items(
+                    status=args.status,
+                    category=args.category,
+                    label=args.label,
+                    q=args.q,
+                    sort=args.sort,
+                    order=args.order,
+                    page_size=args.page_size,
+                    max_pages=args.max_pages,
+                )
+            )
+            rows = _csv_rows(items)
+            writer = csv.writer(sys.stdout, lineterminator="\n")
+            writer.writerow(("id", "name", "status", "category", "labels"))
+            writer.writerows(rows)
+            return 0
+        else:
+            payload = client.item_summary(
                 status=args.status,
                 category=args.category,
                 label=args.label,

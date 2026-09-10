@@ -1,6 +1,9 @@
 import math
+from collections.abc import Iterator
+import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -23,9 +26,19 @@ _QUERY_KEYS = {
 _FACET_ENVELOPE_KEYS = {"data", "filters"}
 _FACET_DATA_KEYS = {"total", "byLabel"}
 _FACET_FILTER_KEYS = {"status", "category", "label", "q"}
-_SORT_FIELDS = {"id", "name", "status"}
+_ITEM_DATA_KEYS = {"id", "name", "status", "category", "labels"}
+_SUMMARY_ENVELOPE_KEYS = {"data", "insights"}
+_SUMMARY_DATA_KEYS = {"total", "byStatus", "byCategory"}
+_SUMMARY_INSIGHT_KEYS = {"total", "matching", "byStatus", "filters"}
+_BATCH_ENVELOPE_KEYS = {"data", "missing"}
+_VOCABULARY_ENVELOPE_KEYS = {"data"}
+_VOCABULARY_DATA_KEYS = {"statuses", "categories", "labels"}
+_SORT_FIELDS = {"id", "name", "status", "category"}
 _SORT_ORDERS = {"asc", "desc"}
+MAX_BATCH_IDS = 50
+_ITEM_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 _CAPABILITY_PATH = "GET /api/capabilities"
+_VOCABULARY_PATH = "GET /api/items/vocabulary"
 _SUPPORTED_CAPABILITY_SCHEMA_VERSION = 1
 _ITEM_FILTER_CAPABILITY_CONTROLS: JsonObject = {
     "status": {
@@ -99,9 +112,33 @@ _REQUIRED_CAPABILITIES: dict[str, JsonObject] = {
         "path": "/api/items/facets",
         "controls": _ITEM_FILTER_CAPABILITY_CONTROLS,
     },
+    "item-summary": {
+        "method": "GET",
+        "path": "/api/items/summary",
+        "controls": _ITEM_FILTER_CAPABILITY_CONTROLS,
+    },
     "capability-discovery": {
         "method": "GET",
         "path": "/api/capabilities",
+    },
+}
+_OPTIONAL_CAPABILITIES: dict[str, JsonObject] = {
+    "item-batch": {
+        "method": "GET",
+        "path": "/api/items/batch",
+        "controls": {
+            "ids": {
+                "type": "string",
+                "cardinality": "single",
+                "nonBlank": True,
+                "minimum": 1,
+                "maximum": MAX_BATCH_IDS,
+            },
+        },
+    },
+    "item-vocabulary": {
+        "method": "GET",
+        "path": "/api/items/vocabulary",
     },
 }
 _ECMASCRIPT_TRIM_CHARACTERS = (
@@ -228,13 +265,23 @@ class ApiError(RuntimeError):
     """Raised when the API cannot return a valid response."""
 
 
+def _validate_timeout(timeout: Any) -> None:
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ApiError("timeout must be a finite positive number")
+    if isinstance(timeout, float) and not math.isfinite(timeout):
+        raise ApiError("timeout must be a finite positive number")
+    if timeout <= 0:
+        raise ApiError("timeout must be a finite positive number")
+
+
 @dataclass
 class ApiClient:
     base_url: str
-    timeout: float = 5.0
+    timeout: int | float = 5.0
     session: requests.Session | None = None
 
     def __post_init__(self) -> None:
+        _validate_timeout(self.timeout)
         self.base_url = self.base_url.rstrip("/")
         if self.session is None:
             self.session = requests.Session()
@@ -254,6 +301,27 @@ class ApiClient:
         if not isinstance(data, list):
             raise ApiError("API response field 'data' must be a list")
         return data
+
+    def get_item(self, item_id: str) -> JsonObject:
+        """Return the validated item identified by one exact path-segment ID."""
+        item_id = _item_id(item_id)
+        encoded_item_id = _item_path_segment(item_id)
+        payload = self._get(
+            f"/api/items/{encoded_item_id}",
+            preserve_path_encoding=item_id in {".", ".."},
+        )
+        _validate_item_envelope(payload, item_id, encoded_item_id)
+        return payload["data"]
+
+    def get_items(self, ids: list[str]) -> JsonObject:
+        """Return found items and missing IDs for one validated batch request."""
+        requested_ids = _validate_batch_ids(ids)
+        payload = self._get(
+            "/api/items/batch",
+            params={"ids": ",".join(requested_ids)},
+        )
+        _validate_batch_envelope(payload, requested_ids)
+        return payload
 
     def discover_items(
         self,
@@ -301,11 +369,128 @@ class ApiClient:
         _validate_facet_envelope(payload, expected_filters, normalized_queries)
         return payload
 
+    def item_summary(
+        self,
+        *,
+        status: str | None = None,
+        category: str | None = None,
+        label: str | None = None,
+        q: str | None = None,
+    ) -> JsonObject:
+        """Return validated provider-owned aggregates for matching items."""
+        params, expected_filters, normalized_queries = _summary_query(
+            status=status,
+            category=category,
+            label=label,
+            q=q,
+        )
+        payload = self._get("/api/items/summary", params=params)
+        _validate_summary_envelope(payload, expected_filters, normalized_queries)
+        return payload
+
+    def iter_items(
+        self,
+        *,
+        status: str | None = None,
+        category: str | None = None,
+        label: str | None = None,
+        q: str | None = None,
+        sort: str | None = None,
+        order: str | None = None,
+        page_size: int = 100,
+        max_pages: int = 1000,
+    ) -> Iterator[JsonObject]:
+        """Lazily yield every item from the matching catalog pages.
+
+        Each page is validated before any of its items are yielded. An
+        ``ApiError`` from a later page can therefore occur after earlier items
+        have already been yielded.
+        """
+        if type(page_size) is not int or not 1 <= page_size <= 100:
+            raise ApiError(
+                "invalid iteration option 'page_size': "
+                "expected an integer from 1 to 100"
+            )
+        if type(max_pages) is not int or max_pages < 1:
+            raise ApiError(
+                "invalid iteration option 'max_pages': "
+                "expected a positive integer"
+            )
+
+        first_page = self.discover_items(
+            status=status,
+            category=category,
+            label=label,
+            q=q,
+            sort=sort,
+            order=order,
+            page=1,
+            limit=page_size,
+        )
+        first_pagination = first_page["pagination"]
+        expected_total = first_pagination["total"]
+        expected_total_pages = first_pagination["totalPages"]
+        if expected_total_pages > max_pages:
+            raise ApiError(
+                "GET /api/items reported "
+                f"{expected_total_pages} pages, exceeding max_pages {max_pages}"
+            )
+
+        seen_ids: set[str] = set()
+        page = first_page
+        for page_number in range(1, expected_total_pages + 1):
+            if page_number > 1:
+                page = self.discover_items(
+                    status=status,
+                    category=category,
+                    label=label,
+                    q=q,
+                    sort=sort,
+                    order=order,
+                    page=page_number,
+                    limit=page_size,
+                )
+
+                pagination = page["pagination"]
+                if (
+                    pagination["total"] != expected_total
+                    or pagination["totalPages"] != expected_total_pages
+                ):
+                    raise ApiError(
+                        "GET /api/items returned pagination totals that changed "
+                        "during iteration"
+                    )
+
+            page_items = page["data"]
+            page_ids: set[str] = set()
+            for item in page_items:
+                item_id = item.get("id")
+                if type(item_id) is not str or not _ecmascript_trim(item_id):
+                    raise ApiError(
+                        "GET /api/items returned an item with an invalid item id; "
+                        "expected a non-blank string"
+                    )
+                if item_id in page_ids or item_id in seen_ids:
+                    raise ApiError(
+                        f"GET /api/items returned duplicate item id {item_id!r}"
+                    )
+                page_ids.add(item_id)
+
+            seen_ids.update(page_ids)
+            yield from page_items
+
+    def item_vocabulary(self) -> JsonObject:
+        """Return the validated complete vocabulary for item filters."""
+        payload = self._get("/api/items/vocabulary")
+        _validate_vocabulary_envelope(payload)
+        return payload
+
     def _get(
         self,
         path: str,
         *,
         params: dict[str, QueryValue] | None = None,
+        preserve_path_encoding: bool = False,
     ) -> JsonObject:
         assert self.session is not None
 
@@ -313,7 +498,19 @@ class ApiClient:
             request_options: dict[str, Any] = {"timeout": self.timeout}
             if params is not None:
                 request_options["params"] = params
-            response = self.session.get(f"{self.base_url}{path}", **request_options)
+            url = f"{self.base_url}{path}"
+            if preserve_path_encoding and isinstance(self.session, requests.Session):
+                # requests' URL preparation decodes percent-encoded unreserved
+                # characters, including the dots in %2E and %2E%2E. Prepare the
+                # request for normal session configuration, then restore the
+                # exact encoded URL before the adapter sends it.
+                prepared = self.session.prepare_request(
+                    requests.Request("GET", url, params=params)
+                )
+                prepared.url = url
+                response = self.session.send(prepared, timeout=self.timeout)
+            else:
+                response = self.session.get(url, **request_options)
         except requests.RequestException as error:
             raise ApiError(f"GET {path} transport failed: {error}") from error
 
@@ -389,6 +586,15 @@ def _validate_capability_manifest(payload: JsonObject) -> None:
             required_fields,
             location=f"capability {capability_id!r}",
         )
+
+    for capability_id, optional_fields in _OPTIONAL_CAPABILITIES.items():
+        capability = capabilities_by_id.get(capability_id)
+        if capability is not None:
+            _validate_required_capability_subset(
+                capability,
+                optional_fields,
+                location=f"capability {capability_id!r}",
+            )
 
 
 def _validate_required_capability_subset(
@@ -564,6 +770,39 @@ def _facet_query(
     label: str | None,
     q: str | None,
 ) -> tuple[dict[str, QueryValue], JsonObject, frozenset[str] | None]:
+    return _filtered_query(
+        status=status,
+        category=category,
+        label=label,
+        q=q,
+        option_group="facet",
+    )
+
+
+def _summary_query(
+    *,
+    status: str | None,
+    category: str | None,
+    label: str | None,
+    q: str | None,
+) -> tuple[dict[str, QueryValue], JsonObject, frozenset[str] | None]:
+    return _filtered_query(
+        status=status,
+        category=category,
+        label=label,
+        q=q,
+        option_group="summary",
+    )
+
+
+def _filtered_query(
+    *,
+    status: str | None,
+    category: str | None,
+    label: str | None,
+    q: str | None,
+    option_group: str,
+) -> tuple[dict[str, QueryValue], JsonObject, frozenset[str] | None]:
     filter_values: dict[str, str | None] = {}
     for name, value in (
         ("status", status),
@@ -574,10 +813,13 @@ def _facet_query(
         canonical_value = _canonical_query_string(
             name,
             value,
-            option_group="facet",
+            option_group=option_group,
         )
         if canonical_value is not None and not _ecmascript_trim(canonical_value):
-            raise ApiError(f"invalid facet option '{name}': expected a non-blank string")
+            raise ApiError(
+                f"invalid {option_group} option '{name}': "
+                "expected a non-blank string"
+            )
         filter_values[name] = canonical_value
 
     status = filter_values["status"]
@@ -599,6 +841,63 @@ def _facet_query(
         "q": _ecmascript_trim(q).lower() if q is not None else None,
     }
     return params, expected_filters, normalized_queries
+
+
+def _item_id(item_id: Any) -> str:
+    if not isinstance(item_id, str):
+        raise ApiError("invalid item id: expected a string")
+    try:
+        # Calling the base implementation rejects surrogate code points before
+        # requests encodes the path and keeps the exact ID text unchanged.
+        item_id = str.encode(item_id, "utf-8", "strict").decode("utf-8")
+    except UnicodeError as error:
+        raise ApiError("invalid item id: expected a valid Unicode string") from error
+    if not _ecmascript_trim(item_id):
+        raise ApiError("invalid item id: expected a non-blank string")
+    return item_id
+
+
+def _item_path_segment(item_id: str) -> str:
+    encoded_item_id = quote(item_id, safe="")
+    if item_id == ".":
+        return "%2E"
+    if item_id == "..":
+        return "%2E%2E"
+    return encoded_item_id
+
+def _validate_batch_ids(ids: Any) -> list[str]:
+    if type(ids) is not list:
+        raise ApiError("invalid batch ids: expected a list")
+    if not 1 <= len(ids) <= MAX_BATCH_IDS:
+        raise ApiError(
+            "invalid batch ids: expected between 1 and "
+            f"{MAX_BATCH_IDS} ids"
+        )
+
+    normalized_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for index, item_id in enumerate(ids):
+        if not isinstance(item_id, str):
+            raise ApiError(
+                f"invalid batch id at index {index}: expected a string"
+            )
+        try:
+            normalized_id = str.encode(item_id, "utf-8", "strict").decode("utf-8")
+        except UnicodeError as error:
+            raise ApiError(
+                f"invalid batch id at index {index}: expected a valid Unicode string"
+            ) from error
+        if _ITEM_ID_PATTERN.fullmatch(normalized_id) is None:
+            raise ApiError(
+                f"invalid batch id at index {index}: expected only letters, "
+                "digits, underscores, or hyphens"
+            )
+        if normalized_id in seen_ids:
+            raise ApiError(f"invalid batch ids: duplicate id {normalized_id!r}")
+        seen_ids.add(normalized_id)
+        normalized_ids.append(normalized_id)
+
+    return normalized_ids
 
 
 def _canonical_query_string(
@@ -695,6 +994,52 @@ def _is_case_ignorable(
     return ("A" + character + "\u03a3").lower().endswith("\u03c2")
 
 
+def _validate_batch_envelope(
+    payload: JsonObject,
+    requested_ids: list[str],
+) -> None:
+    path = "GET /api/items/batch"
+    if set(payload) != _BATCH_ENVELOPE_KEYS:
+        raise ApiError(f"{path} returned an invalid batch envelope")
+
+    data = payload["data"]
+    missing = payload["missing"]
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise ApiError(f"{path} returned invalid batch data")
+    if not isinstance(missing, list) or not all(type(item_id) is str for item_id in missing):
+        raise ApiError(f"{path} returned invalid missing IDs")
+
+    found_ids: list[str] = []
+    for item in data:
+        item_id = item.get("id")
+        if type(item_id) is not str or _ITEM_ID_PATTERN.fullmatch(item_id) is None:
+            raise ApiError(f"{path} returned an item with an invalid ID")
+        if item_id in found_ids:
+            raise ApiError(f"{path} returned duplicate found item IDs")
+        if item_id not in requested_ids:
+            raise ApiError(f"{path} returned an item ID that was not requested")
+        found_ids.append(item_id)
+
+    missing_ids = list(missing)
+    if len(set(missing_ids)) != len(missing_ids):
+        raise ApiError(f"{path} returned duplicate missing IDs")
+    if any(item_id not in requested_ids for item_id in missing_ids):
+        raise ApiError(f"{path} returned a missing ID that was not requested")
+    if set(found_ids).intersection(missing_ids):
+        raise ApiError(f"{path} returned an ID in both partitions")
+
+    expected_found_ids = [
+        item_id for item_id in requested_ids if item_id not in missing_ids
+    ]
+    expected_missing_ids = [
+        item_id for item_id in requested_ids if item_id not in found_ids
+    ]
+    if found_ids != expected_found_ids:
+        raise ApiError(f"{path} returned found items in the wrong order or partition")
+    if missing_ids != expected_missing_ids:
+        raise ApiError(f"{path} returned missing IDs in the wrong order or partition")
+
+
 def _validate_collection_envelope(
     payload: JsonObject,
     expected_query: JsonObject,
@@ -745,20 +1090,41 @@ def _validate_collection_envelope(
         raise ApiError("GET /api/items returned data inconsistent with pagination metadata")
 
 
+def _validate_item_envelope(
+    payload: JsonObject,
+    expected_id: str,
+    encoded_id: str,
+) -> None:
+    path = f"GET /api/items/{encoded_id}"
+    if "data" not in payload:
+        raise ApiError(f"{path} returned an invalid item envelope")
+
+    data = payload["data"]
+    if not isinstance(data, dict) or not _ITEM_DATA_KEYS.issubset(data):
+        raise ApiError(f"{path} returned invalid item data")
+    if type(data["id"]) is not str or data["id"] != expected_id:
+        raise ApiError(f"{path} returned item data with an unexpected id")
+    if any(type(data[name]) is not str for name in ("name", "status", "category")):
+        raise ApiError(f"{path} returned invalid item data")
+    labels = data["labels"]
+    if not isinstance(labels, list) or not all(type(label) is str for label in labels):
+        raise ApiError(f"{path} returned invalid item labels")
+
+
 def _validate_facet_envelope(
     payload: JsonObject,
     expected_filters: JsonObject,
     normalized_queries: frozenset[str] | None,
 ) -> None:
     path = "GET /api/items/facets"
-    if set(payload) != _FACET_ENVELOPE_KEYS:
+    if not _FACET_ENVELOPE_KEYS.issubset(payload):
         raise ApiError(f"{path} returned an invalid facet envelope")
 
     data = payload["data"]
     filters = payload["filters"]
-    if not isinstance(data, dict) or set(data) != _FACET_DATA_KEYS:
+    if not isinstance(data, dict) or not _FACET_DATA_KEYS.issubset(data):
         raise ApiError(f"{path} returned invalid facet data")
-    if not isinstance(filters, dict) or set(filters) != _FACET_FILTER_KEYS:
+    if not isinstance(filters, dict) or not _FACET_FILTER_KEYS.issubset(filters):
         raise ApiError(f"{path} returned invalid filter metadata")
 
     total = data["total"]
@@ -775,6 +1141,27 @@ def _validate_facet_envelope(
     counts = tuple(by_label.values())
     if any(count > total for count in counts) or sum(counts) < total:
         raise ApiError(f"{path} returned label counts inconsistent with the total")
+
+    if "byCategory" in data:
+        by_category = data["byCategory"]
+        if not isinstance(by_category, dict) or not all(
+            type(name) is str
+            and bool(_ecmascript_trim(name))
+            and type(count) is int
+            and count > 0
+            for name, count in by_category.items()
+        ):
+            raise ApiError(f"{path} returned invalid category counts")
+        if sum(by_category.values()) != total:
+            raise ApiError(f"{path} returned category counts inconsistent with the total")
+
+        requested_category = expected_filters["category"]
+        if (
+            requested_category is not None
+            and total > 0
+            and by_category != {requested_category: total}
+        ):
+            raise ApiError(f"{path} returned category counts inconsistent with the request")
 
     requested_label = expected_filters["label"]
     if (
@@ -794,6 +1181,125 @@ def _validate_facet_envelope(
             raise ApiError(
                 f"{path} returned filter metadata that does not match the request"
             )
+
+
+def _validate_summary_envelope(
+    payload: JsonObject,
+    expected_filters: JsonObject,
+    normalized_queries: frozenset[str] | None,
+) -> None:
+    path = "GET /api/items/summary"
+    if not _SUMMARY_ENVELOPE_KEYS.issubset(payload):
+        raise ApiError(f"{path} returned an invalid summary envelope")
+
+    data = payload["data"]
+    insights = payload["insights"]
+    if not isinstance(data, dict) or not _SUMMARY_DATA_KEYS.issubset(data):
+        raise ApiError(f"{path} returned invalid summary data")
+    if not isinstance(insights, dict) or not _SUMMARY_INSIGHT_KEYS.issubset(insights):
+        raise ApiError(f"{path} returned invalid summary insights")
+
+    matching_total = data["total"]
+    global_total = insights["total"]
+    insight_matching = insights["matching"]
+    if type(matching_total) is not int or matching_total < 0:
+        raise ApiError(f"{path} returned invalid matching total")
+    if type(global_total) is not int or global_total < 0:
+        raise ApiError(f"{path} returned invalid global total")
+    if type(insight_matching) is not int or insight_matching < 0:
+        raise ApiError(f"{path} returned invalid insight matching total")
+    if insight_matching != matching_total or global_total < matching_total:
+        raise ApiError(f"{path} returned inconsistent summary totals")
+    if not any(expected_filters.values()) and global_total != matching_total:
+        raise ApiError(f"{path} returned inconsistent unfiltered totals")
+
+    grouping_maps = {
+        "status counts": data["byStatus"],
+        "category counts": data["byCategory"],
+        "insight status counts": insights["byStatus"],
+    }
+    for name, counts in grouping_maps.items():
+        if not isinstance(counts, dict) or not all(
+            type(group) is str
+            and bool(group)
+            and type(count) is int
+            and count >= 0
+            for group, count in counts.items()
+        ):
+            raise ApiError(f"{path} returned invalid {name}")
+        if sum(counts.values()) != matching_total:
+            raise ApiError(f"{path} returned {name} inconsistent with the total")
+
+    by_status = data["byStatus"]
+    by_category = data["byCategory"]
+    if insights["byStatus"] != by_status:
+        raise ApiError(f"{path} returned inconsistent status insights")
+
+    requested_status = expected_filters["status"]
+    if (
+        requested_status is not None
+        and matching_total > 0
+        and by_status != {requested_status: matching_total}
+    ):
+        raise ApiError(f"{path} returned status counts inconsistent with the request")
+    requested_category = expected_filters["category"]
+    if (
+        requested_category is not None
+        and matching_total > 0
+        and by_category != {requested_category: matching_total}
+    ):
+        raise ApiError(f"{path} returned category counts inconsistent with the request")
+
+    filters = insights["filters"]
+    if not isinstance(filters, dict) or not _FACET_FILTER_KEYS.issubset(filters):
+        raise ApiError(f"{path} returned invalid filter metadata")
+    for name, expected_value in expected_filters.items():
+        if not _matches_query_value(
+            name,
+            filters[name],
+            expected_value,
+            normalized_queries,
+        ):
+            raise ApiError(
+                f"{path} returned filter metadata that does not match the request"
+            )
+
+
+def _validate_vocabulary_envelope(payload: JsonObject) -> None:
+    if set(payload) != _VOCABULARY_ENVELOPE_KEYS:
+        raise ApiError(f"{_VOCABULARY_PATH} returned an invalid vocabulary envelope")
+
+    data = payload["data"]
+    if not isinstance(data, dict) or set(data) != _VOCABULARY_DATA_KEYS:
+        raise ApiError(f"{_VOCABULARY_PATH} returned invalid vocabulary data")
+
+    for name in ("statuses", "categories", "labels"):
+        values = data[name]
+        if not isinstance(values, list):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned invalid vocabulary {name}"
+            )
+        if not all(type(value) is str for value in values):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned invalid vocabulary {name}"
+            )
+        if any(not _ecmascript_trim(value) for value in values):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned blank vocabulary {name}"
+            )
+        if len(set(values)) != len(values):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned duplicate vocabulary {name}"
+            )
+        if values != sorted(values, key=_ecmascript_ordinal_key):
+            raise ApiError(
+                f"{_VOCABULARY_PATH} returned unordered vocabulary {name}"
+            )
+
+
+def _ecmascript_ordinal_key(value: str) -> bytes:
+    """Match JavaScript's default Array.sort() UTF-16 code-unit ordering."""
+    return value.encode("utf-16-be", "surrogatepass")
 
 
 def _matches_query_value(
