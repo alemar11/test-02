@@ -289,6 +289,16 @@ class ApiClient:
     def health(self) -> JsonObject:
         return self._get("/health")
 
+    def coordination_probe(self) -> JsonObject:
+        """Validate the opt-in dummy-project coordination contract."""
+        payload = self._get("/api/coordination-probe")
+        if payload.get("protocol") != "se-coordination-v2":
+            raise ApiError("coordination probe protocol mismatch; expected se-coordination-v2")
+        revision = payload.get("revision")
+        if type(revision) is not int or revision != 1:
+            raise ApiError("coordination probe unsupported revision; expected integer 1")
+        return payload
+
     def capabilities(self) -> JsonObject:
         """Return the provider manifest after validating required compatibility."""
         payload = self._get("/api/capabilities")
