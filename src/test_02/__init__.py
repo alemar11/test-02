@@ -1,4 +1,5 @@
 from .cli import main
 from .diagnostics import environment_report
+from .text import count_words
 
-__all__ = ["environment_report", "main"]
+__all__ = ["count_words", "environment_report", "main"]
