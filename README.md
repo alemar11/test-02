@@ -2,7 +2,7 @@
 
 `test-02` is the client repository for the cross-repository test environment.
 It contains a Python client and a small CLI that consume the static GET API
-provided by `test-01`.
+provided by [`test-01`](https://github.com/alemar11/test-01).
 
 There is intentionally no UI, database, or write operation. This repository
 represents the consumer side of the API contract and is the place to develop
